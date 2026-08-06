@@ -5,7 +5,17 @@ set "GW_DIR=C:\Users\SANWU\Documents\Codex\2026-08-06\wo\virtual-companion\gatew
 set "LOBE_DIR=C:\Users\SANWU\Documents\Codex\2026-08-06\wo\virtual-companion\lobehub"
 set "DOCKER=C:\Program Files\Docker\Docker\resources\bin\docker.exe"
 
-echo [1/4] Checking Docker engine...
+echo [1/5] Checking Ollama...
+curl -s http://localhost:11434/api/version >nul 2>&1
+if errorlevel 1 (
+  echo Starting Ollama...
+  start "" "%LOCALAPPDATA%\Programs\Ollama\ollama app.exe"
+  timeout /t 5 /nobreak >nul
+) else (
+  echo Ollama already running.
+)
+
+echo [2/5] Checking Docker engine...
 "%DOCKER%" version --format "{{.Server.Version}}" >nul 2>&1
 if errorlevel 1 goto start_docker
 goto docker_ready
@@ -27,11 +37,11 @@ if errorlevel 1 (
 :docker_ready
 echo Docker engine ready.
 
-echo [2/4] Starting LobeHub containers...
+echo [3/5] Starting LobeHub containers...
 cd /d "%LOBE_DIR%"
 "%DOCKER%" compose up -d
 
-echo [3/4] Starting memory gateway...
+echo [4/5] Starting memory gateway...
 curl -s http://localhost:8080/api/memories >nul 2>&1
 if errorlevel 1 (
   start "" "%GW_DIR%\.venv\Scripts\pythonw.exe" "%GW_DIR%\main.py"
@@ -40,7 +50,7 @@ if errorlevel 1 (
   echo Memory gateway already running.
 )
 
-echo [4/4] Opening LobeHub...
+echo [5/5] Opening LobeHub...
 timeout /t 3 /nobreak >nul
 start "" http://localhost:3210
 echo Done! Kita is waiting for you.

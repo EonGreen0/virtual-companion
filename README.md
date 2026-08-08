@@ -212,7 +212,7 @@ pytest tests -v   # 记忆库单元测试（不依赖网络）
 - [x] 记忆可视化页面
 - [ ] 网关 Docker 化（与 LobeHub 同一 compose）
 - [ ] 图片理解（视觉模型转述）
-- [ ] 语音 TTS/STT
+- [ ] 语音：豆包 TTS 预设音色 + DeepSeek→TTS 文本加工层（情绪标签/语气词/长度控制）
 - [ ] 微信 iLink 通道（含主动消息）
 
 ## 技术栈

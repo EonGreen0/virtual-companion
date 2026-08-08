@@ -35,6 +35,7 @@ class MemoryStore:
                     user_id TEXT NOT NULL DEFAULT 'default',
                     agent_id TEXT NOT NULL DEFAULT 'default',
                     status TEXT NOT NULL DEFAULT 'active',
+                    is_core INTEGER NOT NULL DEFAULT 0,
                     type TEXT NOT NULL DEFAULT 'fact',
                     content TEXT NOT NULL,
                     embedding TEXT NOT NULL,
@@ -54,6 +55,8 @@ class MemoryStore:
                 conn.execute("ALTER TABLE memories ADD COLUMN agent_id TEXT NOT NULL DEFAULT 'default'")
             if "status" not in cols:
                 conn.execute("ALTER TABLE memories ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+            if "is_core" not in cols:
+                conn.execute("ALTER TABLE memories ADD COLUMN is_core INTEGER NOT NULL DEFAULT 0")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(user_id, agent_id)"
             )
@@ -76,9 +79,11 @@ class MemoryStore:
         return float(np.dot(va, vb) / denom)
 
     def _time_decay(self, created_at: float, days_half_life: float = 90.0) -> float:
-        """时间衰减：久未引用的旧记忆降低权重（不删除）。"""
+        """时间新鲜度：最近 3 天的记忆权重拉满，之后按 90 天半衰期衰减。"""
         age_days = (time.time() - created_at) / 86400.0
-        return 0.5 ** (age_days / days_half_life)
+        if age_days <= 3.0:
+            return 1.0
+        return 0.5 ** ((age_days - 3.0) / days_half_life)
 
     def search(
         self,
@@ -116,6 +121,7 @@ class MemoryStore:
                     "user_id": row["user_id"],
                     "agent_id": row["agent_id"],
                     "status": row["status"],
+                    "is_core": row["is_core"],
                     "type": row["type"],
                     "content": row["content"],
                     "importance": row["importance"],
@@ -133,6 +139,7 @@ class MemoryStore:
         importance: float,
         user_id: str = "default",
         agent_id: str = "default",
+        is_core: bool = False,
     ) -> int:
         """新增记忆；若与同作用域内现有记忆高度相似则合并更新。"""
         with self._conn() as conn:
@@ -144,29 +151,32 @@ class MemoryStore:
                 sim = self._cosine(embedding, json.loads(row["embedding"]))
                 if sim >= 0.92:
                     new_importance = max(row["importance"], importance)
+                    keep_content = content if importance >= row["importance"] else row["content"]
+                    new_core = int(row["is_core"] or is_core)
                     conn.execute(
-                        "UPDATE memories SET content=?, importance=?, updated_at=? WHERE id=?",
-                        (content, new_importance, time.time(), row["id"]),
+                        "UPDATE memories SET content=?, importance=?, is_core=?, updated_at=? WHERE id=?",
+                        (keep_content, new_importance, new_core, time.time(), row["id"]),
                     )
                     return row["id"]
                 if 0.85 <= sim < 0.92 and content != row["content"]:
                     # 疑似冲突：内容相似但说法不同，标记为待确认，不参与检索
                     cur = conn.execute(
                         """
-                        INSERT INTO memories (user_id, agent_id, status, type, content, embedding, importance, created_at, updated_at)
-                        VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?)
+                        INSERT INTO memories (user_id, agent_id, status, is_core, type, content, embedding, importance, created_at, updated_at)
+                        VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (user_id, agent_id, type_, content, json.dumps(embedding), importance, time.time(), time.time()),
+                        (user_id, agent_id, int(is_core), type_, content, json.dumps(embedding), importance, time.time(), time.time()),
                     )
                     return cur.lastrowid
             cur = conn.execute(
                 """
-                INSERT INTO memories (user_id, agent_id, status, type, content, embedding, importance, created_at, updated_at)
-                VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?)
+                INSERT INTO memories (user_id, agent_id, status, is_core, type, content, embedding, importance, created_at, updated_at)
+                VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user_id,
                     agent_id,
+                    int(is_core),
                     type_,
                     content,
                     json.dumps(embedding),
@@ -176,6 +186,21 @@ class MemoryStore:
                 ),
             )
             return cur.lastrowid
+
+    def get_core(self, limit: int = 10, user_id: str = "default", agent_id: str = "default") -> list[dict]:
+        """长期核心画像：常驻注入，不依赖向量检索。"""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, type, content, importance, created_at
+                FROM memories
+                WHERE user_id = ? AND agent_id = ? AND status = 'active' AND is_core = 1
+                ORDER BY importance DESC, created_at DESC
+                LIMIT ?
+                """,
+                (user_id, agent_id, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def consolidate(
         self,
@@ -279,7 +304,7 @@ class MemoryStore:
         with self._conn() as conn:
             rows = conn.execute(
                 """
-                SELECT id, user_id, agent_id, status, type, content, importance, access_count, created_at
+                SELECT id, user_id, agent_id, status, is_core, type, content, importance, access_count, created_at
                 FROM memories WHERE user_id = ? AND agent_id = ?
                 ORDER BY created_at DESC
                 """,

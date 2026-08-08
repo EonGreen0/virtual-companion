@@ -64,6 +64,25 @@ def test_delete(tmp_path):
     assert s.delete(mid) is False
 
 
+def test_core_profile(tmp_path):
+    s = make_store(tmp_path)
+    s.add("preference", "用户生日是 3 月 14 日", vec(1.0), 9.0, is_core=True)
+    s.add("event", "昨天一起看了电影", vec(0.5), 7.0, is_core=False)
+    core = s.get_core(limit=10)
+    assert len(core) == 1
+    assert core[0]["content"] == "用户生日是 3 月 14 日"
+    assert core[0]["type"] == "preference"
+
+
+def test_core_flag_survives_merge(tmp_path):
+    s = make_store(tmp_path)
+    s.add("preference", "喜欢喝咖啡", vec(1.0), 6.0, is_core=False)
+    # 同一条记忆再次出现且标记 core，合并后 core 应保留
+    s.add("preference", "用户喜欢喝咖啡", vec(1.0), 8.0, is_core=True)
+    core = s.get_core(limit=10)
+    assert len(core) == 1
+
+
 def test_consolidate_resolves_conflict(tmp_path):
     s = make_store(tmp_path)
     s.add("preference", "喜欢冰美式", vec(1.0), 6.0)

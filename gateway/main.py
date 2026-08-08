@@ -121,13 +121,15 @@ def build_memory_block(memories: list[dict]) -> str:
 
 EXTRACT_PROMPT = """你是记忆提取器。从下面这段对话中，提取对一段长期亲密关系值得记住的信息。
 只提取明确表达或可可靠推断的事实，不要编造。输出 JSON：
-{"memories":[{"type":"fact|preference|event","content":"一句话描述","importance":1到10}]}
+{"memories":[{"type":"fact|preference|event","content":"一句话描述","importance":1到10,"core":false}]}
 
 规则：
 - fact：关于用户的客观事实（身份、工作、习惯、家人等）
 - preference：用户的喜好/厌恶/雷点（语气、食物、话题等）
 - event：你们之间的共同事件或关系里程碑（约定、纪念日、一起做过的事）
-- 每段对话最多提取 5 条，宁缺毋滥
+- core：只有长期稳定、几乎不会变的核心信息才标 true（生日、姓名、职业、永久禁忌、长期稳定的喜好），
+  这类信息会常驻在每次对话中，所以务必宁缺毋滥，模棱两可的一律 false
+- 每段对话最多提取 5 条，宁缺毋滥；避免流水账（"今天吃了饭"这种不值得记）
 - 只用中文输出，不要解释
 
 对话：
@@ -159,10 +161,11 @@ async def extract_memories(dialog_text: str) -> None:
             type_ = item.get("type", "fact")
             text = item.get("content", "").strip()
             importance = float(item.get("importance", 5))
+            is_core = bool(item.get("core", False))
             if not text or type_ not in ("fact", "preference", "event"):
                 continue
             emb = await store.embed(text)
-            store.add(type_, text, emb, importance)
+            store.add(type_, text, emb, importance, is_core=is_core)
         logger.info("已提取 %d 条候选记忆", len(parsed.get("memories", [])))
     except Exception as exc:
         logger.warning("记忆提取失败: %s", exc)
@@ -178,6 +181,11 @@ async def chat_completions(request: Request):
     user_text = extract_user_text(messages)
     memory_block = ""
     retrieved = []
+    core_block = ""
+    try:
+        core_block = build_memory_block(store.get_core(limit=10))
+    except Exception as exc:
+        logger.warning("核心画像读取失败: %s", exc)
     if user_text.strip():
         try:
             query_emb = await store.embed(user_text)
@@ -191,17 +199,22 @@ async def chat_completions(request: Request):
     upstream_messages = []
     for msg in messages:
         upstream_messages.append(msg)
-    if memory_block:
+    if core_block or memory_block:
         base = upstream_messages[0] if upstream_messages and upstream_messages[0].get("role") == "system" else {"role": "system", "content": ""}
         if upstream_messages and upstream_messages[0].get("role") == "system":
             base = upstream_messages[0]
         else:
             upstream_messages.insert(0, base)
+        memory_section = ""
+        if core_block:
+            memory_section += "【你对 TA 的核心了解（永远记得）】\n" + core_block + "\n\n"
+        if memory_block:
+            memory_section += "【相关回忆】\n" + memory_block + "\n\n"
         base["content"] = (
             base.get("content", "")
-            + "\n\n【你的长期记忆（按相关度排序）】\n"
-            + memory_block
-            + "\n\n自然地使用这些记忆，但不要刻意提及「记忆」这个词。"
+            + "\n\n"
+            + memory_section
+            + "自然地使用这些信息，但不要刻意提及「记忆」「回忆」这类词。"
         )
     if retrieved:
         logger.info(

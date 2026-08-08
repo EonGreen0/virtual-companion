@@ -10,6 +10,7 @@
 - 🧠 长期记忆：对话后自动提取重要信息（偏好、事件、约定），下次聊天自动回忆
 - 🎭 自定义角色：任意角色卡即可塑造（内置喜多郁代示例人格卡 + 知识库）
 - 🔍 本地向量检索：Ollama + bge-m3，记忆与知识库检索全部本地完成
+- 🌙 夜间整理：每天自动去重、合并相似记忆、解决冲突、遗忘降权
 - ⏱ 一键启动：重启电脑后双击 `gateway/start.bat` 全部恢复
 
 ## 需要的工具（前置条件）
@@ -136,7 +137,8 @@ virtual-companion/
 
 Linux / macOS 用户运行 `bash gateway/start.sh`，效果相同。
 
-查看她记住了什么：访问 http://localhost:8080/api/memories
+查看她记住了什么：访问 http://localhost:8080/memories（可视化页面，可手动删除）
+JSON 接口：http://localhost:8080/api/memories
 
 ## 数据备份
 
@@ -146,6 +148,14 @@ Linux / macOS 用户运行 `bash gateway/start.sh`，效果相同。
 2. `lobehub/data/` — LobeHub 账号、聊天记录、知识库
 
 直接复制到移动硬盘 / 云盘即可。恢复时放回原位置，然后 `docker compose up -d`。
+
+## 记忆系统说明
+
+- 记忆按（用户, 角色）隔离，不会串号
+- 对话后自动提取 `fact`（事实）/ `preference`（偏好）/ `event`（事件）
+- 疑似冲突（同一话题两种说法）会标记为 `pending`，不参与检索，每天凌晨 3 点自动整理解决
+- 每天凌晨 3 点自动执行：解决冲突、合并重复记忆、对 180 天未使用的记忆降权
+- 检索评分 = 相似度 × 重要度 × 时间衰减
 
 ## 常见问题
 
@@ -179,7 +189,15 @@ Linux / macOS 用户运行 `bash gateway/start.sh`，效果相同。
 | 文件 | 用途 |
 |---|---|
 | `lobehub/.env` | LobeHub 数据库、S3、密钥配置 |
-| `gateway/.env` | DeepSeek API Key、恋人名称、网关端口、鉴权、记忆检索参数 |
+| `gateway/.env` | DeepSeek API Key、恋人名称（COMPANION_NAME）、网关端口、鉴权（GATEWAY_API_KEY）、记忆检索参数 |
+
+## 开发
+
+```bash
+cd gateway
+pip install -r requirements-dev.txt
+pytest tests -v   # 记忆库单元测试（不依赖网络）
+```
 
 ## 路线图
 
@@ -187,10 +205,13 @@ Linux / macOS 用户运行 `bash gateway/start.sh`，效果相同。
 - [x] 示例角色 Agent + 知识库
 - [x] 本地 embedding + 知识库 RAG
 - [x] 记忆网关（提取 / 检索 / 注入）
+- [x] 记忆隔离（用户 / 角色）与冲突检测
+- [x] 夜间整理（去重 / 冲突解决 / 遗忘降权）
+- [x] 记忆可视化页面
+- [ ] 网关 Docker 化（与 LobeHub 同一 compose）
 - [ ] 图片理解（视觉模型转述）
 - [ ] 语音 TTS/STT
 - [ ] 微信 iLink 通道（含主动消息）
-- [ ] 夜间记忆整理（去重、遗忘、时间线）
 
 ## 技术栈
 

@@ -7,12 +7,13 @@ import asyncio
 import json
 import logging
 import os
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from memory_store import MemoryStore
@@ -55,6 +56,27 @@ async def verify_api_key(
 
 store = MemoryStore(BASE_DIR / "memory.db", OLLAMA_URL, EMBEDDING_MODEL)
 app = FastAPI(title="Companion Memory Gateway")
+
+
+async def consolidation_loop() -> None:
+    """每天 03:00 自动执行记忆整理：冲突处理、去重合并、遗忘降权。"""
+    while True:
+        now = datetime.now()
+        next_run = now.replace(hour=3, minute=0, second=0, microsecond=0)
+        if next_run <= now:
+            next_run += timedelta(days=1)
+        await asyncio.sleep((next_run - now).total_seconds())
+        try:
+            stats = store.consolidate()
+            logger.info("夜间记忆整理完成: %s", stats)
+        except Exception as exc:
+            logger.warning("夜间记忆整理失败: %s", exc)
+
+
+@app.on_event("startup")
+async def startup() -> None:
+    asyncio.create_task(consolidation_loop())
+    logger.info("记忆整理任务已调度（每天 03:00）")
 
 
 @app.get("/")
@@ -267,6 +289,57 @@ async def models_legacy():
 @app.get("/api/memories", dependencies=[Depends(verify_api_key)])
 async def list_memories():
     return {"memories": store.list_all(), "stats": store.stats()}
+
+
+@app.get("/memories", response_class=HTMLResponse)
+async def memories_page():
+    """记忆可视化页面：查看 / 删除她记住的内容。"""
+    items = store.list_all()
+    rows = "\n".join(
+        f"""
+        <tr>
+          <td>{m['id']}</td>
+          <td>{m['type']}</td>
+          <td>{m['status']}</td>
+          <td class="content">{m['content']}</td>
+          <td>{m['importance']:.0f}</td>
+          <td>{m['access_count']}</td>
+          <td><button onclick="delMem({m['id']})">删除</button></td>
+        </tr>"""
+        for m in items
+    )
+    return f"""<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>她的记忆</title>
+<style>
+  body {{ font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 1000px; padding: 0 1rem; }}
+  h1 {{ color: #333; }}
+  table {{ width: 100%; border-collapse: collapse; }}
+  th, td {{ border: 1px solid #ddd; padding: 8px 12px; text-align: left; font-size: 14px; }}
+  th {{ background: #f5f5f5; }}
+  .content {{ max-width: 480px; }}
+  button {{ cursor: pointer; }}
+  .stats {{ color: #666; margin-bottom: 1rem; }}
+</style>
+</head>
+<body>
+  <h1>🧠 她的记忆</h1>
+  <p class="stats">共 {len(items)} 条 | 记忆按相关度自动注入对话 | <a href="/health">健康状态</a></p>
+  <table>
+    <thead><tr><th>ID</th><th>类型</th><th>状态</th><th>内容</th><th>重要度</th><th>被想起次数</th><th>操作</th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+  <script>
+    async function delMem(id) {{
+      if (!confirm('确定删除这条记忆？')) return;
+      const r = await fetch('/api/memories/' + id, {{ method: 'DELETE' }});
+      if (r.ok) location.reload();
+    }}
+  </script>
+</body>
+</html>"""
 
 
 @app.delete("/api/memories/{memory_id}", dependencies=[Depends(verify_api_key)])

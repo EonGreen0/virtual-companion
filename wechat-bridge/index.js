@@ -20,6 +20,7 @@ import http from "node:http";
 import { WeixinBot } from "@chnak/weixin-bot";
 import { ProactiveScheduler, splitMessage } from "./proactive.js";
 import { setTimeout as delay } from "node:timers/promises";
+import { describeImageMessage } from "./vision.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -164,19 +165,63 @@ function enqueueMessage(bot, msg) {
   knownUsers.set(userId, { lastActive: Date.now() });
   saveKnownUsers();
 
+  // 图片消息：异步解析（下载 + 解密 + 视觉转述），完成后以文本消息入队
+  if (msg.type === "image") {
+    enqueueImage(bot, msg);
+    return;
+  }
+
   let entry = pendingMessages.get(userId);
   if (!entry) {
-    entry = { items: [], timer: null };
+    entry = { items: [], timer: null, waitingImages: 0 };
     pendingMessages.set(userId, entry);
   }
   entry.items.push(msg);
   if (entry.timer) clearTimeout(entry.timer);
-  entry.timer = setTimeout(() => {
-    pendingMessages.delete(userId);
-    handleMessage(bot, userId, entry.items).catch((err) =>
-      console.error(`[bridge] 处理消息失败: ${err}`),
+  entry.timer = setTimeout(() => flushEntry(bot, userId, entry), DEBOUNCE_MS);
+}
+
+async function enqueueImage(bot, msg) {
+  const userId = msg.userId;
+  let entry = pendingMessages.get(userId);
+  if (!entry) {
+    entry = { items: [], timer: null, waitingImages: 0 };
+    pendingMessages.set(userId, entry);
+  }
+  entry.waitingImages += 1;
+  if (entry.timer) clearTimeout(entry.timer);
+
+  let text;
+  try {
+    console.log("[bridge] 收到图片，开始解析...");
+    const dbgItem = msg.raw?.item_list?.[0]?.image_item;
+    console.log(
+      `[bridge] 图片调试: type=${msg.type} text=${String(msg.text).slice(0, 40)} ` +
+        `itemKeys=${Object.keys(dbgItem ?? {}).join(",")} full_url=${String(dbgItem?.full_url ?? "").slice(0, 60)}`,
     );
-  }, DEBOUNCE_MS);
+    const desc = await describeImageMessage(msg);
+    text = `（用户发来一张图片：${desc}）`;
+    console.log(`[bridge] 图片解析完成: ${desc.slice(0, 40)}`);
+  } catch (err) {
+    console.error(`[bridge] 图片解析失败: ${err.message} | raw=${JSON.stringify(msg.raw ?? null).slice(0, 2000)}`);
+    text = "（用户发来一张图片，内容暂不可见）";
+  }
+
+  entry.waitingImages -= 1;
+  const virtualMsg = { ...msg, type: "text", text };
+  enqueueMessage(bot, virtualMsg);
+}
+
+function flushEntry(bot, userId, entry) {
+  if (entry.waitingImages > 0) {
+    // 还有图片在解析，稍等再处理，保证图片与后续文字合并
+    entry.timer = setTimeout(() => flushEntry(bot, userId, entry), 500);
+    return;
+  }
+  pendingMessages.delete(userId);
+  handleMessage(bot, userId, entry.items).catch((err) =>
+    console.error(`[bridge] 处理消息失败: ${err}`),
+  );
 }
 
 async function main() {

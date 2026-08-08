@@ -114,7 +114,13 @@ class MemoryStore:
             scored.append((score, row))
         scored.sort(key=lambda x: x[0], reverse=True)
         result = []
+        chosen_embeddings = []
         for score, row in scored[:top_k]:
+            row_emb = json.loads(row["embedding"])
+            # 多样性去重：与已入选记忆高度相似的同主题记忆不再重复注入
+            if any(self._cosine(row_emb, chosen) >= 0.88 for chosen in chosen_embeddings):
+                continue
+            chosen_embeddings.append(row_emb)
             result.append(
                 {
                     "id": row["id"],
@@ -129,6 +135,8 @@ class MemoryStore:
                     "created_at": row["created_at"],
                 }
             )
+            if len(result) >= top_k:
+                break
         return result
 
     def add(

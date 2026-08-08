@@ -15,7 +15,11 @@
 
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { readFile, writeFile } from "node:fs/promises";
+import http from "node:http";
 import { WeixinBot } from "@chnak/weixin-bot";
+import { ProactiveScheduler, splitMessage } from "./proactive.js";
+import { setTimeout as delay } from "node:timers/promises";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -24,12 +28,38 @@ const GATEWAY_MODEL = process.env.GATEWAY_MODEL || "deepseek-v4-flash";
 const TOKEN_PATH = process.env.TOKEN_PATH || path.join(__dirname, "credentials.json");
 const HISTORY_LIMIT = 10; // 每用户保留的对话轮数
 const TYPING_INTERVAL_MS = 3000; // 模拟持续「正在输入」
+const REPLY_PART_DELAY_MS = 1200; // 回复分包发送间隔
+const REPLY_MAX_PARTS = 3; // 回复最多拆几条
+const REPLY_MAX_PART_LENGTH = 42; // 每段最大字数
+const USERS_FILE = path.join(__dirname, "known-users.json");
+const BRIDGE_PORT = parseInt(process.env.BRIDGE_PORT ?? "9090", 10);
 
 /** 每用户的对话历史：userId -> [{role, content}] */
 const history = new Map();
+/** 已知用户：userId -> { lastActive }（主动消息需要知道发给谁） */
+const knownUsers = new Map();
+
+async function loadKnownUsers() {
+  try {
+    const raw = await readFile(USERS_FILE, "utf8");
+    for (const [userId, info] of Object.entries(JSON.parse(raw))) {
+      knownUsers.set(userId, info);
+    }
+  } catch {
+    /* 首次运行没有文件，正常 */
+  }
+}
+
+async function saveKnownUsers() {
+  try {
+    await writeFile(USERS_FILE, JSON.stringify(Object.fromEntries(knownUsers), null, 2));
+  } catch (err) {
+    console.error(`[bridge] 保存用户列表失败: ${err.message}`);
+  }
+}
 
 /** 调用记忆网关生成回复（人格 + 记忆由网关注入） */
-async function askGateway(messages) {
+async function askGateway(messages, { wechatStyle = false } = {}) {
   const resp = await fetch(`${GATEWAY_URL}/v1/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -37,6 +67,7 @@ async function askGateway(messages) {
       model: GATEWAY_MODEL,
       stream: false,
       messages,
+      ...(wechatStyle ? { wechat_style: true } : {}),
     }),
     signal: AbortSignal.timeout(180_000),
   });
@@ -62,6 +93,10 @@ async function keepTyping(bot, userId, task) {
 }
 
 async function handleMessage(bot, msg) {
+  console.log("[bridge] 开始处理消息");
+  knownUsers.set(msg.userId, { lastActive: Date.now() });
+  saveKnownUsers();
+
   const text = (msg.text || "").trim();
   if (!text) {
     return;
@@ -75,7 +110,9 @@ async function handleMessage(bot, msg) {
 
   let reply;
   try {
-    reply = await keepTyping(bot, msg.userId, () => askGateway(messages));
+    console.log("[bridge] 调用网关...");
+    reply = await keepTyping(bot, msg.userId, () => askGateway(messages, { wechatStyle: true }));
+    console.log(`[bridge] 网关返回 ${reply.length} 字`);
   } catch (err) {
     console.error(`[bridge] 网关调用失败: ${err.message}`);
     reply = "唔……我刚才走神了一下，你能再说一遍吗？";
@@ -88,7 +125,24 @@ async function handleMessage(bot, msg) {
   }
   history.set(msg.userId, prev);
 
-  await bot.reply(msg, reply);
+  // 拟人化分包发送：拆成 2~3 条短消息，失败自动降级为合并发送
+  const parts = splitMessage(reply, REPLY_MAX_PART_LENGTH, REPLY_MAX_PARTS);
+  console.log(`[bridge] 分包 ${parts.length} 条，开始发送`);
+  try {
+    for (const part of parts) {
+      await bot.reply(msg, part);
+      await delay(REPLY_PART_DELAY_MS);
+    }
+  } catch (sendErr) {
+    const remaining = parts.join("");
+    console.warn(`[bridge] 分包发送失败（${sendErr.message}），降级为整条发送`);
+    try {
+      await bot.reply(msg, remaining);
+    } catch (fallbackErr) {
+      console.error(`[bridge] 降级发送也失败: ${fallbackErr.message}`);
+    }
+  }
+  console.log("[bridge] 发送完成");
   console.log(
     `[bridge] ${msg.timestamp?.toLocaleTimeString?.() ?? ""} ${msg.userId}: ${text.slice(0, 40)} → ${reply.length} 字`,
   );
@@ -97,6 +151,8 @@ async function handleMessage(bot, msg) {
 async function main() {
   const forceLogin = process.argv.includes("--login");
   const loginOnly = process.argv.includes("--login-only") || forceLogin;
+  const poke = process.argv.includes("--poke");
+  await loadKnownUsers();
   const bot = new WeixinBot({
     tokenPath: TOKEN_PATH,
     onError: (err) => console.error(`[bridge] 轮询错误: ${err}`),
@@ -116,6 +172,41 @@ async function main() {
   bot.onMessage((msg) => {
     handleMessage(bot, msg).catch((err) => console.error(`[bridge] 处理消息失败: ${err}`));
   });
+
+  const scheduler = new ProactiveScheduler(bot, {
+    getUsers: () =>
+      [...knownUsers.entries()].map(([userId, info]) => ({ userId, lastActive: info.lastActive })),
+  });
+  if (poke) {
+    console.log("[bridge] 手动触发一次主动消息...");
+    await scheduler.poke();
+    process.exit(0);
+  }
+  await scheduler.start();
+
+  // 本地控制接口（仅 127.0.0.1）：手动触发主动消息 / 查看状态
+  const controlServer = http.createServer(async (req, res) => {
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    try {
+      const url = new URL(req.url, "http://127.0.0.1");
+      if (url.pathname === "/poke") {
+        await scheduler.poke();
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      if (url.pathname === "/status") {
+        res.end(JSON.stringify(scheduler.status()));
+        return;
+      }
+      res.statusCode = 404;
+      res.end(JSON.stringify({ error: "not found" }));
+    } catch (err) {
+      res.statusCode = 500;
+      res.end(JSON.stringify({ error: err.message }));
+    }
+  });
+  controlServer.listen(BRIDGE_PORT, "127.0.0.1");
+  console.log(`[bridge] 控制接口 http://127.0.0.1:${BRIDGE_PORT}（/poke 手动触发，/status 状态）`);
 
   await bot.run();
 }

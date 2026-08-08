@@ -7,7 +7,8 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "login": "node index.js --login"
+    "login": "node index.js --login",
+    "poke": "node index.js --poke"
   },
   "engines": {
     "node": ">=18"

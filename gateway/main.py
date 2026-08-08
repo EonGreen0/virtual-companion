@@ -190,6 +190,8 @@ async def chat_completions(request: Request):
     messages = body.get("messages", [])
     stream = body.get("stream", False)
     model = body.get("model") or DEEPSEEK_MODEL
+    skip_extract = bool(body.get("skip_extract", False))
+    wechat_style = bool(body.get("wechat_style", False))
 
     user_text = extract_user_text(messages)
     memory_block = ""
@@ -234,6 +236,17 @@ async def chat_completions(request: Request):
             + memory_section
             + "自然地使用这些信息，但不要刻意提及「记忆」「回忆」这类词。"
         )
+    if wechat_style:
+        style_note = (
+            "\n\n【微信聊天场景】你现在是在和用户用微信聊天。回复要像真人发微信："
+            "口语化短句，用换行分段，每段不超过 40 字，最多 3 段，段与段之间空行。"
+            "不要使用 Markdown、列表或标题。"
+        )
+        base_sys = upstream_messages[0] if upstream_messages and upstream_messages[0].get("role") == "system" else None
+        if base_sys is not None:
+            base_sys["content"] = (base_sys.get("content", "") or "") + style_note
+        else:
+            upstream_messages.insert(0, {"role": "system", "content": style_note.strip()})
     if retrieved:
         logger.info(
             "检索命中 %d 条记忆（最高分 %.3f），注入成功",
@@ -249,6 +262,7 @@ async def chat_completions(request: Request):
 
     async def proxy_stream():
         collected = []
+        collected_reasoning = []
         async with httpx.AsyncClient(timeout=600) as client:
             async with client.stream("POST", f"{DEEPSEEK_BASE_URL}/chat/completions", headers=headers, json=payload) as resp:
                 if resp.status_code != 200:
@@ -265,10 +279,13 @@ async def chat_completions(request: Request):
                                 delta = chunk.get("choices", [{}])[0].get("delta", {})
                                 if isinstance(delta.get("content"), str):
                                     collected.append(delta["content"])
+                                elif isinstance(delta.get("reasoning_content"), str):
+                                    collected_reasoning.append(delta["reasoning_content"])
                             except json.JSONDecodeError:
                                 pass
-        if collected:
-            dialog = f"用户: {user_text[:1500]}\n{COMPANION_NAME}: {''.join(collected)[:2000]}"
+        full_reply = "".join(collected) or "".join(collected_reasoning)
+        if full_reply and not skip_extract:
+            dialog = f"用户: {user_text[:1500]}\n{COMPANION_NAME}: {full_reply[:2000]}"
             asyncio.create_task(extract_memories(dialog))
 
     async def proxy_nonstream():
@@ -282,8 +299,10 @@ async def chat_completions(request: Request):
                     content={"error": {"message": resp.text[:500], "status_code": resp.status_code}},
                 )
             data = resp.json()
-            if collected := data.get("choices", [{}])[0].get("message", {}).get("content"):
-                dialog = f"用户: {user_text[:1500]}\n{COMPANION_NAME}: {collected[:2000]}"
+            message = data.get("choices", [{}])[0].get("message", {})
+            full_reply = message.get("content") or message.get("reasoning_content") or ""
+            if full_reply and not skip_extract:
+                dialog = f"用户: {user_text[:1500]}\n{COMPANION_NAME}: {full_reply[:2000]}"
                 asyncio.create_task(extract_memories(dialog))
             return JSONResponse(content=data)
 

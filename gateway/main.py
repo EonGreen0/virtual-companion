@@ -33,6 +33,7 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
 COMPANION_NAME = os.getenv("COMPANION_NAME", "AI")
+PERSONA_FILE = os.getenv("PERSONA_FILE", str(BASE_DIR.parent / "persona" / "喜多郁代-人格卡-xml.md"))
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "bge-m3")
 PORT = int(os.getenv("GATEWAY_PORT", "8080"))
@@ -56,6 +57,15 @@ async def verify_api_key(
 
 store = MemoryStore(BASE_DIR / "memory.db", OLLAMA_URL, EMBEDDING_MODEL)
 app = FastAPI(title="Companion Memory Gateway")
+
+
+def load_persona() -> str:
+    """读取默认人格卡；请求本身不带 system 时自动注入。"""
+    try:
+        return Path(PERSONA_FILE).read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        logger.warning("人格卡读取失败（%s），请求将不注入默认人格", exc)
+        return ""
 
 
 async def consolidation_loop() -> None:
@@ -127,6 +137,9 @@ EXTRACT_PROMPT = """你是记忆提取器。从下面这段对话中，提取对
 - fact：关于用户的客观事实（身份、工作、习惯、家人等）
 - preference：用户的喜好/厌恶/雷点（语气、食物、话题等）
 - event：你们之间的共同事件或关系里程碑（约定、纪念日、一起做过的事）
+- 严格区分人称：只有用户亲口说过的关于自己的话，才能记为用户的 fact/preference；
+  角色（喜多）对自己外貌、习惯的自我描述，绝不能记成用户的特征；
+  归属不确定的信息一律不提取
 - core：只有长期稳定、几乎不会变的核心信息才标 true（生日、姓名、职业、永久禁忌、长期稳定的喜好），
   这类信息会常驻在每次对话中，所以务必宁缺毋滥，模棱两可的一律 false
 - 每段对话最多提取 5 条，宁缺毋滥；避免流水账（"今天吃了饭"这种不值得记）
@@ -199,6 +212,11 @@ async def chat_completions(request: Request):
     upstream_messages = []
     for msg in messages:
         upstream_messages.append(msg)
+    has_system = any(m.get("role") == "system" and str(m.get("content", "")).strip() for m in upstream_messages)
+    if not has_system:
+        persona = load_persona()
+        if persona:
+            upstream_messages.insert(0, {"role": "system", "content": persona})
     if core_block or memory_block:
         base = upstream_messages[0] if upstream_messages and upstream_messages[0].get("role") == "system" else {"role": "system", "content": ""}
         if upstream_messages and upstream_messages[0].get("role") == "system":

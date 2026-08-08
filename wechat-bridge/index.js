@@ -31,6 +31,7 @@ const TYPING_INTERVAL_MS = 3000; // 模拟持续「正在输入」
 const REPLY_PART_DELAY_MS = 1200; // 回复分包发送间隔
 const REPLY_MAX_PARTS = 3; // 回复最多拆几条
 const REPLY_MAX_PART_LENGTH = 42; // 每段最大字数
+const DEBOUNCE_MS = parseInt(process.env.MESSAGE_DEBOUNCE_MS ?? "3500", 10); // 消息聚合等待
 const USERS_FILE = path.join(__dirname, "known-users.json");
 const BRIDGE_PORT = parseInt(process.env.BRIDGE_PORT ?? "9090", 10);
 
@@ -38,6 +39,8 @@ const BRIDGE_PORT = parseInt(process.env.BRIDGE_PORT ?? "9090", 10);
 const history = new Map();
 /** 已知用户：userId -> { lastActive }（主动消息需要知道发给谁） */
 const knownUsers = new Map();
+/** 待聚合消息：userId -> { items: [], timer } */
+const pendingMessages = new Map();
 
 async function loadKnownUsers() {
   try {
@@ -92,26 +95,33 @@ async function keepTyping(bot, userId, task) {
   }
 }
 
-async function handleMessage(bot, msg) {
-  console.log("[bridge] 开始处理消息");
-  knownUsers.set(msg.userId, { lastActive: Date.now() });
-  saveKnownUsers();
+async function handleMessage(bot, userId, items) {
+  console.log(`[bridge] 开始处理 ${items.length} 条聚合消息`);
 
-  const text = (msg.text || "").trim();
-  if (!text) {
-    return;
+  // 合并多条消息：文本直接拼接，非文本消息标注占位
+  const mergedParts = [];
+  for (const m of items) {
+    const text = (m.text || "").trim();
+    if (text) {
+      mergedParts.push(text);
+    } else if (m.type && m.type !== "text") {
+      const labels = { image: "一张图片", voice: "一条语音", file: "一个文件", video: "一个视频" };
+      mergedParts.push(`（用户发来${labels[m.type] ?? "一条消息"}，内容暂不可见）`);
+    }
   }
+  const combined = mergedParts.join("\n");
+  if (!combined) return;
 
-  const prev = history.get(msg.userId) || [];
+  const prev = history.get(userId) || [];
   const messages = [
     ...prev.map((m) => ({ role: m.role, content: m.content })),
-    { role: "user", content: text },
+    { role: "user", content: `用户连续发来几条消息：\n${combined}` },
   ];
 
   let reply;
   try {
     console.log("[bridge] 调用网关...");
-    reply = await keepTyping(bot, msg.userId, () => askGateway(messages, { wechatStyle: true }));
+    reply = await keepTyping(bot, userId, () => askGateway(messages, { wechatStyle: true }));
     console.log(`[bridge] 网关返回 ${reply.length} 字`);
   } catch (err) {
     console.error(`[bridge] 网关调用失败: ${err.message}`);
@@ -119,33 +129,54 @@ async function handleMessage(bot, msg) {
   }
 
   // 更新会话历史
-  prev.push({ role: "user", content: text }, { role: "assistant", content: reply });
+  prev.push({ role: "user", content: combined }, { role: "assistant", content: reply });
   if (prev.length > HISTORY_LIMIT * 2) {
     prev.splice(0, prev.length - HISTORY_LIMIT * 2);
   }
-  history.set(msg.userId, prev);
+  history.set(userId, prev);
 
   // 拟人化分包发送：拆成 2~3 条短消息，失败自动降级为合并发送
   const parts = splitMessage(reply, REPLY_MAX_PART_LENGTH, REPLY_MAX_PARTS);
   console.log(`[bridge] 分包 ${parts.length} 条，开始发送`);
+  const replyTarget = items[items.length - 1]; // 用最新一条消息的 context_token
   try {
     for (const part of parts) {
-      await bot.reply(msg, part);
+      await bot.reply(replyTarget, part);
       await delay(REPLY_PART_DELAY_MS);
     }
   } catch (sendErr) {
     const remaining = parts.join("");
     console.warn(`[bridge] 分包发送失败（${sendErr.message}），降级为整条发送`);
     try {
-      await bot.reply(msg, remaining);
+      await bot.reply(replyTarget, remaining);
     } catch (fallbackErr) {
       console.error(`[bridge] 降级发送也失败: ${fallbackErr.message}`);
     }
   }
   console.log("[bridge] 发送完成");
   console.log(
-    `[bridge] ${msg.timestamp?.toLocaleTimeString?.() ?? ""} ${msg.userId}: ${text.slice(0, 40)} → ${reply.length} 字`,
+    `[bridge] ${new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" })} ${userId}: ${combined.slice(0, 40)} → ${reply.length} 字`,
   );
+}
+
+function enqueueMessage(bot, msg) {
+  const userId = msg.userId;
+  knownUsers.set(userId, { lastActive: Date.now() });
+  saveKnownUsers();
+
+  let entry = pendingMessages.get(userId);
+  if (!entry) {
+    entry = { items: [], timer: null };
+    pendingMessages.set(userId, entry);
+  }
+  entry.items.push(msg);
+  if (entry.timer) clearTimeout(entry.timer);
+  entry.timer = setTimeout(() => {
+    pendingMessages.delete(userId);
+    handleMessage(bot, userId, entry.items).catch((err) =>
+      console.error(`[bridge] 处理消息失败: ${err}`),
+    );
+  }, DEBOUNCE_MS);
 }
 
 async function main() {
@@ -170,7 +201,7 @@ async function main() {
   console.log("[bridge] 登录成功，开始监听微信消息");
 
   bot.onMessage((msg) => {
-    handleMessage(bot, msg).catch((err) => console.error(`[bridge] 处理消息失败: ${err}`));
+    enqueueMessage(bot, msg);
   });
 
   const scheduler = new ProactiveScheduler(bot, {

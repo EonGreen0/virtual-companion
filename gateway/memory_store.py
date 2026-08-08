@@ -1,4 +1,7 @@
-"""轻量记忆库：SQLite 存储 + Ollama embedding + 余弦相似度检索。"""
+"""轻量记忆库：SQLite 存储 + Ollama embedding + 余弦相似度检索。
+
+记忆按 (user_id, agent_id) 隔离，避免多用户 / 多角色串记忆。
+"""
 
 import json
 import math
@@ -29,6 +32,8 @@ class MemoryStore:
                 """
                 CREATE TABLE IF NOT EXISTS memories (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL DEFAULT 'default',
+                    agent_id TEXT NOT NULL DEFAULT 'default',
                     type TEXT NOT NULL DEFAULT 'fact',
                     content TEXT NOT NULL,
                     embedding TEXT NOT NULL,
@@ -40,8 +45,14 @@ class MemoryStore:
                 )
                 """
             )
+            # 旧库迁移：补上 user_id / agent_id 列
+            cols = [row[1] for row in conn.execute("PRAGMA table_info(memories)")]
+            if "user_id" not in cols:
+                conn.execute("ALTER TABLE memories ADD COLUMN user_id TEXT NOT NULL DEFAULT 'default'")
+            if "agent_id" not in cols:
+                conn.execute("ALTER TABLE memories ADD COLUMN agent_id TEXT NOT NULL DEFAULT 'default'")
             conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(type)"
+                "CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(user_id, agent_id)"
             )
 
     async def embed(self, text: str) -> list[float]:
@@ -66,9 +77,25 @@ class MemoryStore:
         age_days = (time.time() - created_at) / 86400.0
         return 0.5 ** (age_days / days_half_life)
 
-    def search(self, embedding: list[float], top_k: int = 8, threshold: float = 0.30) -> list[dict]:
+    def search(
+        self,
+        embedding: list[float],
+        top_k: int = 8,
+        threshold: float = 0.30,
+        user_id: str = "default",
+        agent_id: str = "default",
+    ) -> list[dict]:
+        """检索记忆；只扫描同作用域内最近 5000 条，避免全表扫描失控。"""
         with self._conn() as conn:
-            rows = conn.execute("SELECT * FROM memories").fetchall()
+            rows = conn.execute(
+                """
+                SELECT * FROM memories
+                WHERE user_id = ? AND agent_id = ?
+                ORDER BY updated_at DESC
+                LIMIT 5000
+                """,
+                (user_id, agent_id),
+            ).fetchall()
         scored = []
         for row in rows:
             sim = self._cosine(embedding, json.loads(row["embedding"]))
@@ -83,6 +110,8 @@ class MemoryStore:
             result.append(
                 {
                     "id": row["id"],
+                    "user_id": row["user_id"],
+                    "agent_id": row["agent_id"],
                     "type": row["type"],
                     "content": row["content"],
                     "importance": row["importance"],
@@ -92,10 +121,21 @@ class MemoryStore:
             )
         return result
 
-    def add(self, type_: str, content: str, embedding: list[float], importance: float) -> int:
-        """新增记忆；若与现有记忆高度相似则合并更新。"""
+    def add(
+        self,
+        type_: str,
+        content: str,
+        embedding: list[float],
+        importance: float,
+        user_id: str = "default",
+        agent_id: str = "default",
+    ) -> int:
+        """新增记忆；若与同作用域内现有记忆高度相似则合并更新。"""
         with self._conn() as conn:
-            rows = conn.execute("SELECT * FROM memories").fetchall()
+            rows = conn.execute(
+                "SELECT * FROM memories WHERE user_id = ? AND agent_id = ?",
+                (user_id, agent_id),
+            ).fetchall()
             for row in rows:
                 sim = self._cosine(embedding, json.loads(row["embedding"]))
                 if sim >= 0.92:
@@ -107,10 +147,12 @@ class MemoryStore:
                     return row["id"]
             cur = conn.execute(
                 """
-                INSERT INTO memories (type, content, embedding, importance, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO memories (user_id, agent_id, type, content, embedding, importance, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    user_id,
+                    agent_id,
                     type_,
                     content,
                     json.dumps(embedding),
@@ -128,19 +170,30 @@ class MemoryStore:
                 (time.time(), memory_id),
             )
 
-    def list_all(self) -> list[dict]:
+    def list_all(self, user_id: str = "default", agent_id: str = "default") -> list[dict]:
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT id, type, content, importance, access_count, created_at FROM memories ORDER BY created_at DESC"
+                """
+                SELECT id, user_id, agent_id, type, content, importance, access_count, created_at
+                FROM memories WHERE user_id = ? AND agent_id = ?
+                ORDER BY created_at DESC
+                """,
+                (user_id, agent_id),
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def delete(self, memory_id: int) -> bool:
+    def delete(self, memory_id: int, user_id: str = "default", agent_id: str = "default") -> bool:
         with self._conn() as conn:
-            cur = conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
+            cur = conn.execute(
+                "DELETE FROM memories WHERE id=? AND user_id=? AND agent_id=?",
+                (memory_id, user_id, agent_id),
+            )
             return cur.rowcount > 0
 
-    def stats(self) -> dict:
+    def stats(self, user_id: str = "default", agent_id: str = "default") -> dict:
         with self._conn() as conn:
-            total = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+            total = conn.execute(
+                "SELECT COUNT(*) FROM memories WHERE user_id = ? AND agent_id = ?",
+                (user_id, agent_id),
+            ).fetchone()[0]
         return {"total_memories": total}

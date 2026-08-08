@@ -99,7 +99,7 @@ virtual-companion/
 
 ## 快速开始（本地）
 
-前置条件：Docker Desktop、Node.js、Python 3.12+、Ollama。
+前置条件：Docker Desktop、Python 3.12+、Ollama。
 
 1. **部署 LobeHub**：进入 `lobehub/`，复制 `.env.zh-CN.example` 为 `.env`，生成密钥，然后：
    ```bash
@@ -117,18 +117,52 @@ virtual-companion/
    ```bash
    cd gateway
    python -m venv .venv
+   # Windows:
    .venv\Scripts\pip install -r requirements.txt
-   copy .env.example .env   # 填写 DEEPSEEK_API_KEY
    .venv\Scripts\python main.py
+   # Linux / macOS:
+   .venv/bin/pip install -r requirements.txt
+   .venv/bin/python main.py
    ```
+   首次使用先复制 `.env.example` 为 `.env` 并填写 `DEEPSEEK_API_KEY`。
 
 4. **接入网关**：在 LobeHub 的 DeepSeek 供应商中，把 API 地址改为 `http://host.docker.internal:8080`（LobeHub 在容器内，通过 host.docker.internal 访问宿主机网关）。之后所有对话自动获得记忆能力。
+
+   > 如果设置了 `GATEWAY_API_KEY`，LobeHub 里 DeepSeek 的 API Key 也要填同一个值。
 
 ## 日常使用
 
 重启电脑后，双击 `gateway/start.bat`，脚本会自动：拉起 Docker Desktop → 恢复 LobeHub 容器 → 启动记忆网关 → 打开浏览器。
 
+Linux / macOS 用户运行 `bash gateway/start.sh`，效果相同。
+
 查看她记住了什么：访问 http://localhost:8080/api/memories
+
+## 数据备份
+
+重要数据只有两个位置，备份 = 复制这两个目录：
+
+1. `gateway/memory.db` — 她的长期记忆
+2. `lobehub/data/` — LobeHub 账号、聊天记录、知识库
+
+直接复制到移动硬盘 / 云盘即可。恢复时放回原位置，然后 `docker compose up -d`。
+
+## 常见问题
+
+**重启电脑后喜多没有记忆？**
+先确认 `start.bat` / `start.sh` 已运行（网关端口 8080 有响应）。没有的话重新双击启动脚本。
+
+**聊天报 404 / 无法连接模型？**
+确认 LobeHub 的 DeepSeek API 地址是 `http://host.docker.internal:8080`（容器访问宿主机必须用这个地址，不能用 localhost）。
+
+**上传知识库卡住？**
+确认 Ollama 正在运行且 bge-m3 已下载（`ollama pull bge-m3`），LobeHub 的 Ollama 供应商地址是 `http://host.docker.internal:11434`。
+
+**如何换一个角色？**
+见「自定义角色」：写一份角色卡 → 在 LobeHub 创建新 Agent 并粘贴 → 可选上传知识库。网关通过 `COMPANION_NAME` 配置角色名。
+
+**不想让别人访问我的网关？**
+在 `gateway/.env` 设置 `GATEWAY_API_KEY`，并把 LobeHub 里 DeepSeek 的 API Key 改成同一个值。
 
 ## 自定义角色
 
@@ -145,7 +179,7 @@ virtual-companion/
 | 文件 | 用途 |
 |---|---|
 | `lobehub/.env` | LobeHub 数据库、S3、密钥配置 |
-| `gateway/.env` | DeepSeek API Key、网关端口、记忆检索参数 |
+| `gateway/.env` | DeepSeek API Key、恋人名称、网关端口、鉴权、记忆检索参数 |
 
 ## 路线图
 

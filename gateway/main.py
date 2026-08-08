@@ -1,18 +1,29 @@
-"""虚拟恋人记忆网关：OpenAI 兼容接口，注入记忆 → 转发 DeepSeek → 异步提取记忆。"""
+"""虚拟恋人记忆网关：OpenAI 兼容接口，注入记忆 → 转发 DeepSeek → 异步提取记忆。
+
+角色无关：人格由上游（LobeHub Agent / 微信桥接）提供，网关只负责记忆。
+"""
 
 import asyncio
 import json
+import logging
 import os
 from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from memory_store import MemoryStore
 
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("gateway")
 
 BASE_DIR = Path(__file__).parent
 load_dotenv(BASE_DIR / ".env")
@@ -20,11 +31,27 @@ load_dotenv(BASE_DIR / ".env")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+COMPANION_NAME = os.getenv("COMPANION_NAME", "AI")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "bge-m3")
 PORT = int(os.getenv("GATEWAY_PORT", "8080"))
 MEMORY_TOP_K = int(os.getenv("MEMORY_TOP_K", "8"))
 MEMORY_SIMILARITY_THRESHOLD = float(os.getenv("MEMORY_SIMILARITY_THRESHOLD", "0.30"))
+GATEWAY_API_KEY = os.getenv("GATEWAY_API_KEY", "")
+
+
+async def verify_api_key(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None),
+) -> None:
+    """可选鉴权：设置了 GATEWAY_API_KEY 后，所有模型与记忆接口都需要正确 Key。"""
+    if not GATEWAY_API_KEY:
+        return
+    token = x_api_key
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization[7:].strip()
+    if not token or token != GATEWAY_API_KEY:
+        raise HTTPException(status_code=401, detail="invalid gateway api key")
 
 store = MemoryStore(BASE_DIR / "memory.db", OLLAMA_URL, EMBEDDING_MODEL)
 app = FastAPI(title="Companion Memory Gateway")
@@ -34,6 +61,15 @@ app = FastAPI(title="Companion Memory Gateway")
 async def root():
     """LobeHub 连通性检测会请求根路径，返回 200 即可。"""
     return {"status": "ok", "service": "companion-memory-gateway", "message": "memory gateway is running"}
+
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "memories": store.stats(),
+        "companion": COMPANION_NAME,
+    }
 
 
 def extract_user_text(messages: list[dict]) -> str:
@@ -105,12 +141,12 @@ async def extract_memories(dialog_text: str) -> None:
                 continue
             emb = await store.embed(text)
             store.add(type_, text, emb, importance)
-        print(f"[memory] 已提取 {len(parsed.get('memories', []))} 条候选记忆")
+        logger.info("已提取 %d 条候选记忆", len(parsed.get("memories", [])))
     except Exception as exc:
-        print(f"[memory] 提取失败: {exc}")
+        logger.warning("记忆提取失败: %s", exc)
 
 
-@app.post("/v1/chat/completions")
+@app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
 async def chat_completions(request: Request):
     body = await request.json()
     messages = body.get("messages", [])
@@ -125,8 +161,10 @@ async def chat_completions(request: Request):
             query_emb = await store.embed(user_text)
             retrieved = store.search(query_emb, top_k=MEMORY_TOP_K, threshold=MEMORY_SIMILARITY_THRESHOLD)
             memory_block = build_memory_block(retrieved)
+            for m in retrieved:
+                store.mark_used(m["id"])
         except Exception as exc:
-            print(f"[memory] 检索失败(降级为无记忆): {exc}")
+            logger.warning("记忆检索失败(降级为无记忆): %s", exc)
 
     upstream_messages = []
     for msg in messages:
@@ -143,12 +181,11 @@ async def chat_completions(request: Request):
             + memory_block
             + "\n\n自然地使用这些记忆，但不要刻意提及「记忆」这个词。"
         )
-    with open(BASE_DIR / "gateway.log", "a", encoding="utf-8") as logf:
-        logf.write(
-            f"user_text: {user_text[:120]}\n"
-            f"retrieved: {len(retrieved)} 条\n"
-            f"injected_system_tail: ...{upstream_messages[0].get('content', '')[-600:]}\n"
-            "---\n"
+    if retrieved:
+        logger.info(
+            "检索命中 %d 条记忆（最高分 %.3f），注入成功",
+            len(retrieved),
+            retrieved[0]["score"],
         )
 
     payload = {**body, "model": model, "messages": upstream_messages}
@@ -178,7 +215,7 @@ async def chat_completions(request: Request):
                             except json.JSONDecodeError:
                                 pass
         if collected:
-            dialog = f"用户: {user_text[:1500]}\n喜多: {''.join(collected)[:2000]}"
+            dialog = f"用户: {user_text[:1500]}\n{COMPANION_NAME}: {''.join(collected)[:2000]}"
             asyncio.create_task(extract_memories(dialog))
 
     async def proxy_nonstream():
@@ -193,7 +230,7 @@ async def chat_completions(request: Request):
                 )
             data = resp.json()
             if collected := data.get("choices", [{}])[0].get("message", {}).get("content"):
-                dialog = f"用户: {user_text[:1500]}\n喜多: {collected[:2000]}"
+                dialog = f"用户: {user_text[:1500]}\n{COMPANION_NAME}: {collected[:2000]}"
                 asyncio.create_task(extract_memories(dialog))
             return JSONResponse(content=data)
 
@@ -202,13 +239,13 @@ async def chat_completions(request: Request):
     return await proxy_nonstream()
 
 
-@app.post("/chat/completions")
+@app.post("/chat/completions", dependencies=[Depends(verify_api_key)])
 async def chat_completions_legacy(request: Request):
     """兼容 DeepSeek 风格的不带 /v1 路径。"""
     return await chat_completions(request)
 
 
-@app.get("/v1/models")
+@app.get("/v1/models", dependencies=[Depends(verify_api_key)])
 async def models():
     return {
         "object": "list",
@@ -222,17 +259,17 @@ async def models():
     }
 
 
-@app.get("/models")
+@app.get("/models", dependencies=[Depends(verify_api_key)])
 async def models_legacy():
     return await models()
 
 
-@app.get("/api/memories")
+@app.get("/api/memories", dependencies=[Depends(verify_api_key)])
 async def list_memories():
     return {"memories": store.list_all(), "stats": store.stats()}
 
 
-@app.delete("/api/memories/{memory_id}")
+@app.delete("/api/memories/{memory_id}", dependencies=[Depends(verify_api_key)])
 async def delete_memory(memory_id: int):
     return {"deleted": store.delete(memory_id)}
 

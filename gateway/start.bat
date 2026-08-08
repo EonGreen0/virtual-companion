@@ -1,9 +1,11 @@
 @echo off
 chcp 65001 >nul
 setlocal
-set "GW_DIR=C:\Users\SANWU\Documents\Codex\2026-08-06\wo\virtual-companion\gateway"
-set "LOBE_DIR=C:\Users\SANWU\Documents\Codex\2026-08-06\wo\virtual-companion\lobehub"
+rem %~dp0 是脚本所在目录，自动定位，不依赖绝对路径
+set "GW_DIR=%~dp0"
+set "LOBE_DIR=%GW_DIR%..\lobehub"
 set "DOCKER=C:\Program Files\Docker\Docker\resources\bin\docker.exe"
+if not exist "%DOCKER%" set "DOCKER=docker"
 
 echo [1/5] Checking Ollama...
 curl -s http://localhost:11434/api/version >nul 2>&1

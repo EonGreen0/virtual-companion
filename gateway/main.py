@@ -200,6 +200,7 @@ async def chat_completions(request: Request):
     model = body.get("model") or DEEPSEEK_MODEL
     skip_extract = bool(body.get("skip_extract", False))
     wechat_style = bool(body.get("wechat_style", False))
+    voice_style = bool(body.get("voice_style", False))
 
     user_text = extract_user_text(messages)
     memory_block = ""
@@ -255,6 +256,20 @@ async def chat_completions(request: Request):
             base_sys["content"] = (base_sys.get("content", "") or "") + style_note
         else:
             upstream_messages.insert(0, {"role": "system", "content": style_note.strip()})
+    if voice_style:
+        voice_note = (
+            "\n\n【语音回复模式】你的回复将用语音朗读给用户听。要求：\n"
+            "1. 口语化、适合朗读：不要 Markdown、括号动作、表情符号\n"
+            "2. 短句，全文 60 字以内，像真人发语音\n"
+            "3. 最后单独一行输出情绪标签：<emotion>none|happy|sad|angry</emotion>\n"
+            "4. 情绪必须克制：默认 none；只有内容本身确实需要强烈情绪（如大悲大喜）才用 happy/sad/angry；"
+            "不要夸张、不要每句都带情绪、避免戏剧化"
+        )
+        base_sys = upstream_messages[0] if upstream_messages and upstream_messages[0].get("role") == "system" else None
+        if base_sys is not None:
+            base_sys["content"] = (base_sys.get("content", "") or "") + voice_note
+        else:
+            upstream_messages.insert(0, {"role": "system", "content": voice_note.strip()})
     if retrieved:
         logger.info(
             "检索命中 %d 条记忆（最高分 %.3f），注入成功",

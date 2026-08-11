@@ -14,6 +14,7 @@
     "node": ">=18"
   },
   "dependencies": {
-    "@chnak/weixin-bot": "^1.2.9"
+    "@chnak/weixin-bot": "^1.2.9",
+    "silk-wasm": "^3.7.1"
   }
 }

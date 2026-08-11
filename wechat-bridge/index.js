@@ -17,10 +17,18 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { readFile, writeFile } from "node:fs/promises";
 import http from "node:http";
+import { randomUUID } from "node:crypto";
 import { WeixinBot } from "@chnak/weixin-bot";
 import { ProactiveScheduler, splitMessage } from "./proactive.js";
 import { setTimeout as delay } from "node:timers/promises";
 import { describeImageMessage } from "./vision.js";
+import { synthesizeSpeech, EMOTION_WHITELIST } from "./tts.js";
+import {
+  sendVoiceWithMeta,
+  uploadVoiceToCdn,
+  postSendMessage,
+  notifyStart,
+} from "./send-voice.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -63,7 +71,7 @@ async function saveKnownUsers() {
 }
 
 /** 调用记忆网关生成回复（人格 + 记忆由网关注入） */
-async function askGateway(messages, { wechatStyle = false } = {}) {
+async function askGateway(messages, { wechatStyle = false, voiceStyle = false } = {}) {
   const resp = await fetch(`${GATEWAY_URL}/v1/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -72,6 +80,7 @@ async function askGateway(messages, { wechatStyle = false } = {}) {
       stream: false,
       messages,
       ...(wechatStyle ? { wechat_style: true } : {}),
+      ...(voiceStyle ? { voice_style: true } : {}),
     }),
     signal: AbortSignal.timeout(180_000),
   });
@@ -98,6 +107,7 @@ async function keepTyping(bot, userId, task) {
 
 async function handleMessage(bot, userId, items) {
   console.log(`[bridge] 开始处理 ${items.length} 条聚合消息`);
+  const wantVoice = items.some((m) => m.type === "voice");
 
   // 合并多条消息：文本直接拼接，非文本消息标注占位
   const mergedParts = [];
@@ -122,7 +132,9 @@ async function handleMessage(bot, userId, items) {
   let reply;
   try {
     console.log("[bridge] 调用网关...");
-    reply = await keepTyping(bot, userId, () => askGateway(messages, { wechatStyle: true }));
+    reply = await keepTyping(bot, userId, () =>
+      askGateway(messages, { wechatStyle: true, voiceStyle: wantVoice }),
+    );
     console.log(`[bridge] 网关返回 ${reply.length} 字`);
   } catch (err) {
     console.error(`[bridge] 网关调用失败: ${err.message}`);
@@ -136,28 +148,82 @@ async function handleMessage(bot, userId, items) {
   }
   history.set(userId, prev);
 
-  // 拟人化分包发送：拆成 2~3 条短消息，失败自动降级为合并发送
-  const parts = splitMessage(reply, REPLY_MAX_PART_LENGTH, REPLY_MAX_PARTS);
-  console.log(`[bridge] 分包 ${parts.length} 条，开始发送`);
   const replyTarget = items[items.length - 1]; // 用最新一条消息的 context_token
-  try {
-    for (const part of parts) {
-      await bot.reply(replyTarget, part);
-      await delay(REPLY_PART_DELAY_MS);
-    }
-  } catch (sendErr) {
-    const remaining = parts.join("");
-    console.warn(`[bridge] 分包发送失败（${sendErr.message}），降级为整条发送`);
+  if (wantVoice) {
+    await sendVoiceReply(bot, replyTarget, reply);
+  } else {
+    // 拟人化分包发送：拆成 2~3 条短消息，失败自动降级为合并发送
+    const parts = splitMessage(reply, REPLY_MAX_PART_LENGTH, REPLY_MAX_PARTS);
+    console.log(`[bridge] 分包 ${parts.length} 条，开始发送`);
     try {
-      await bot.reply(replyTarget, remaining);
-    } catch (fallbackErr) {
-      console.error(`[bridge] 降级发送也失败: ${fallbackErr.message}`);
+      for (const part of parts) {
+        await bot.reply(replyTarget, part);
+        await delay(REPLY_PART_DELAY_MS);
+      }
+    } catch (sendErr) {
+      const remaining = parts.join("");
+      console.warn(`[bridge] 分包发送失败（${sendErr.message}），降级为整条发送`);
+      try {
+        await bot.reply(replyTarget, remaining);
+      } catch (fallbackErr) {
+        console.error(`[bridge] 降级发送也失败: ${fallbackErr.message}`);
+      }
     }
   }
   console.log("[bridge] 发送完成");
   console.log(
     `[bridge] ${new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" })} ${userId}: ${combined.slice(0, 40)} → ${reply.length} 字`,
   );
+}
+
+/** 解析语音回复：提取 <emotion> 标签并清理朗读文本 */
+function parseVoiceReply(text) {
+  const match = text.match(/<emotion>\s*([a-z]+)\s*<\/emotion>/i);
+  let emotion = match ? match[1].toLowerCase() : "none";
+  if (!EMOTION_WHITELIST.has(emotion)) emotion = "";
+  const clean = text
+    .replace(/<emotion>\s*[a-z]+\s*<\/emotion>/gi, "")
+    .replace(/[*_#`>]/g, "")
+    .replace(/[（(][^）)]*[）)]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  // 情绪克制：标签必须与文本中的情绪词匹配才生效，否则按无情绪处理
+  const emotionKeywords = {
+    happy: ["开心", "高兴", "太棒", "超棒", "好耶", "哇", "哈哈", "嘻嘻", "耶"],
+    sad: ["难过", "伤心", "委屈", "呜呜", "哭了", "好累", "唉"],
+    angry: ["生气", "讨厌", "气死", "可恶", "哼"],
+  };
+  if (emotion && !emotionKeywords[emotion].some((k) => clean.includes(k))) {
+    emotion = "";
+  }
+  return { emotion, text: clean.slice(0, 80) };
+}
+
+/** 语音回复：豆包 TTS → silk → 微信语音；失败降级为文字 */
+async function sendVoiceReply(bot, replyTarget, reply) {
+  const { emotion, text } = parseVoiceReply(reply);
+  if (!text) {
+    console.warn("[bridge] 语音回复文本为空，跳过");
+    return;
+  }
+  try {
+    console.log(`[bridge] 合成语音（情绪: ${emotion || "无"}）: ${text.slice(0, 30)}...`);
+    const { silk, durationMs } = await synthesizeSpeech(text, emotion);
+    await sendVoiceWithMeta(bot, {
+      userId: replyTarget.userId,
+      contextToken: replyTarget._contextToken,
+      silk,
+      durationMs,
+    });
+    console.log(`[bridge] 语音已发送（${Math.round(durationMs / 1000)} 秒）`);
+  } catch (err) {
+    console.error(`[bridge] 语音合成/发送失败，降级为文字: ${err.message}`);
+    try {
+      await bot.reply(replyTarget, text);
+    } catch (fallbackErr) {
+      console.error(`[bridge] 降级文字发送失败: ${fallbackErr.message}`);
+    }
+  }
 }
 
 function enqueueMessage(bot, msg) {
@@ -175,6 +241,27 @@ function enqueueMessage(bot, msg) {
   if (!entry) {
     entry = { items: [], timer: null, waitingImages: 0 };
     pendingMessages.set(userId, entry);
+  }
+  if (msg.type === "voice") {
+    // 语音消息自带转文字（msg.text），直接当作文本入队，并标记需要语音回复
+    msg.text = (msg.text || "").trim() || "（语音消息，内容暂不可见）";
+    // 临时诊断：打印微信端语音消息的原始字段（脱敏），用于对照发送格式
+    try {
+      const vi = msg.raw?.item_list?.[0]?.voice_item;
+      if (vi) {
+        console.log(
+          `[bridge] 收到语音字段: encode_type=${vi.encode_type} sample_rate=${vi.sample_rate} ` +
+            `bits_per_sample=${vi.bits_per_sample} playtime=${vi.playtime} ` +
+            `text=${String(vi.text ?? "").slice(0, 30)} ` +
+            `media.encrypt_type=${vi.media?.encrypt_type} ` +
+            `media.full_url=${String(vi.media?.full_url ?? "").slice(0, 80)} ` +
+            `media.encrypt_query_param_len=${String(vi.media?.encrypt_query_param ?? "").length} ` +
+            `media.aes_key_len=${String(vi.media?.aes_key ?? "").length}`,
+        );
+      }
+    } catch (err) {
+      console.error(`[bridge] 语音字段解析失败: ${err.message}`);
+    }
   }
   entry.items.push(msg);
   if (entry.timer) clearTimeout(entry.timer);
@@ -244,6 +331,12 @@ async function main() {
   console.log("[bridge] 启动（如需重新扫码请用 npm run login）...");
   await bot.login({ force: false });
   console.log("[bridge] 登录成功，开始监听微信消息");
+  try {
+    const ns = await notifyStart(bot);
+    console.log(`[bridge] notifyStart 完成: ${JSON.stringify(ns).slice(0, 200)}`);
+  } catch (err) {
+    console.warn(`[bridge] notifyStart 失败（忽略）: ${err.message}`);
+  }
 
   bot.onMessage((msg) => {
     enqueueMessage(bot, msg);
@@ -272,6 +365,53 @@ async function main() {
       }
       if (url.pathname === "/status") {
         res.end(JSON.stringify(scheduler.status()));
+        return;
+      }
+      if (url.pathname === "/test-image") {
+        // 临时诊断：给第一个已知用户发一张测试图片，验证“外发媒体”链路
+        const firstUser = [...knownUsers.keys()][0];
+        if (!firstUser) {
+          res.end(JSON.stringify({ error: "没有已知用户" }));
+          return;
+        }
+        let png;
+        try {
+          png = await readFile(path.join(__dirname, "test-image-real.png"));
+        } catch {
+          png = Buffer.from(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+            "base64",
+          );
+        }
+        // 与官方 openclaw 一致：CDN 上传 → x-encrypted-param → image_item
+        const tokenChoice = url.searchParams.get("token") || "upload";
+        const uploaded = await uploadVoiceToCdn(bot, firstUser, png, 1);
+        const credentials = await bot.ensureCredentials();
+        const downloadToken =
+          tokenChoice === "short" ? uploaded.shortParam : uploaded.uploadParam;
+        console.log(`[test-image] token=${tokenChoice} len=${downloadToken?.length ?? 0}`);
+        await postSendMessage(bot.baseUrl, credentials.token, {
+          from_user_id: "",
+          to_user_id: firstUser,
+          client_id: randomUUID(),
+          message_type: 2,
+          message_state: 2,
+          context_token: bot.contextTokens.get(firstUser),
+          item_list: [
+            {
+              type: 2,
+              image_item: {
+                media: {
+                  encrypt_query_param: downloadToken,
+                  aes_key: Buffer.from(uploaded.aeskey).toString("base64"),
+                  encrypt_type: 1,
+                },
+                mid_size: uploaded.fileSizeCiphertext,
+              },
+            },
+          ],
+        });
+        res.end(JSON.stringify({ ok: true, to: firstUser }));
         return;
       }
       res.statusCode = 404;

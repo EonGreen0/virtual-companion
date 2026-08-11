@@ -11,7 +11,7 @@
     "poke": "node index.js --poke"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "dependencies": {
     "@chnak/weixin-bot": "^1.2.9",

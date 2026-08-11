@@ -24,7 +24,7 @@
 | Python 3.12+ | 运行记忆网关 | 必需 |
 | DeepSeek API Key | 对话主力模型 | 必需（见下方模型建议） |
 | Git | 版本管理 / 上传 GitHub | 开发必需 |
-| Node.js 18+ | 微信 iLink 桥接 | 必需（微信通道） |
+| Node.js 22+ | 微信 iLink 桥接 | 必需（微信通道，微信 SDK 要求） |
 | 豆包 TTS API Key | 语音回复合成（seed-tts-2.0） | 微信语音功能必需 |
 | 火山方舟 API Key | 图片理解（视觉转述） | 微信图片功能必需 |
 | 浏览器 | 访问 LobeHub 界面 | 任意现代浏览器即可 |

@@ -17,18 +17,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { readFile, writeFile } from "node:fs/promises";
 import http from "node:http";
-import { randomUUID } from "node:crypto";
 import { WeixinBot } from "@chnak/weixin-bot";
 import { ProactiveScheduler, splitMessage } from "./proactive.js";
 import { setTimeout as delay } from "node:timers/promises";
 import { describeImageMessage } from "./vision.js";
 import { synthesizeSpeech, EMOTION_WHITELIST } from "./tts.js";
-import {
-  sendVoiceWithMeta,
-  uploadVoiceToCdn,
-  postSendMessage,
-  notifyStart,
-} from "./send-voice.js";
+import { sendVoiceWithMeta, notifyStart } from "./send-voice.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -276,23 +270,6 @@ function enqueueMessage(bot, msg) {
   if (msg.type === "voice") {
     // 语音消息自带转文字（msg.text），直接当作文本入队，并标记需要语音回复
     msg.text = (msg.text || "").trim() || "（语音消息，内容暂不可见）";
-    // 临时诊断：打印微信端语音消息的原始字段（脱敏），用于对照发送格式
-    try {
-      const vi = msg.raw?.item_list?.[0]?.voice_item;
-      if (vi) {
-        console.log(
-          `[bridge] 收到语音字段: encode_type=${vi.encode_type} sample_rate=${vi.sample_rate} ` +
-            `bits_per_sample=${vi.bits_per_sample} playtime=${vi.playtime} ` +
-            `text=${String(vi.text ?? "").slice(0, 30)} ` +
-            `media.encrypt_type=${vi.media?.encrypt_type} ` +
-            `media.full_url=${String(vi.media?.full_url ?? "").slice(0, 80)} ` +
-            `media.encrypt_query_param_len=${String(vi.media?.encrypt_query_param ?? "").length} ` +
-            `media.aes_key_len=${String(vi.media?.aes_key ?? "").length}`,
-        );
-      }
-    } catch (err) {
-      console.error(`[bridge] 语音字段解析失败: ${err.message}`);
-    }
   }
   entry.items.push(msg);
   if (entry.timer) clearTimeout(entry.timer);
@@ -312,11 +289,6 @@ async function enqueueImage(bot, msg) {
   let text;
   try {
     console.log("[bridge] 收到图片，开始解析...");
-    const dbgItem = msg.raw?.item_list?.[0]?.image_item;
-    console.log(
-      `[bridge] 图片调试: type=${msg.type} text=${String(msg.text).slice(0, 40)} ` +
-        `itemKeys=${Object.keys(dbgItem ?? {}).join(",")} full_url=${String(dbgItem?.full_url ?? "").slice(0, 60)}`,
-    );
     const desc = await describeImageMessage(msg);
     text = `（用户发来一张图片：${desc}）`;
     console.log(`[bridge] 图片解析完成: ${desc.slice(0, 40)}`);
@@ -396,53 +368,6 @@ async function main() {
       }
       if (url.pathname === "/status") {
         res.end(JSON.stringify(scheduler.status()));
-        return;
-      }
-      if (url.pathname === "/test-image") {
-        // 临时诊断：给第一个已知用户发一张测试图片，验证“外发媒体”链路
-        const firstUser = [...knownUsers.keys()][0];
-        if (!firstUser) {
-          res.end(JSON.stringify({ error: "没有已知用户" }));
-          return;
-        }
-        let png;
-        try {
-          png = await readFile(path.join(__dirname, "test-image-real.png"));
-        } catch {
-          png = Buffer.from(
-            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
-            "base64",
-          );
-        }
-        // 与官方 openclaw 一致：CDN 上传 → x-encrypted-param → image_item
-        const tokenChoice = url.searchParams.get("token") || "upload";
-        const uploaded = await uploadVoiceToCdn(bot, firstUser, png, 1);
-        const credentials = await bot.ensureCredentials();
-        const downloadToken =
-          tokenChoice === "short" ? uploaded.shortParam : uploaded.uploadParam;
-        console.log(`[test-image] token=${tokenChoice} len=${downloadToken?.length ?? 0}`);
-        await postSendMessage(bot.baseUrl, credentials.token, {
-          from_user_id: "",
-          to_user_id: firstUser,
-          client_id: randomUUID(),
-          message_type: 2,
-          message_state: 2,
-          context_token: bot.contextTokens.get(firstUser),
-          item_list: [
-            {
-              type: 2,
-              image_item: {
-                media: {
-                  encrypt_query_param: downloadToken,
-                  aes_key: Buffer.from(uploaded.aeskey).toString("base64"),
-                  encrypt_type: 1,
-                },
-                mid_size: uploaded.fileSizeCiphertext,
-              },
-            },
-          ],
-        });
-        res.end(JSON.stringify({ ok: true, to: firstUser }));
         return;
       }
       res.statusCode = 404;

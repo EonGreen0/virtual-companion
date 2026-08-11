@@ -57,8 +57,8 @@ async function apiFetch(baseUrl, endpoint, body, token, timeoutMs = 30_000) {
   return data;
 }
 
-/** 媒体专用上传：捕获 CDN 返回的全部 token 与 URL 参数（诊断用） */
-export async function uploadVoiceToCdn(bot, toUserId, silk, mediaType = 4) {
+/** 媒体专用上传：加密文件 → CDN 上传 → 返回下载凭证与 AES 密钥 */
+async function uploadVoiceToCdn(bot, toUserId, silk, mediaType = 4) {
   const credentials = await bot.ensureCredentials();
   const rawsize = silk.length;
   const rawfilemd5 = createHash("md5").update(silk).digest("hex");
@@ -90,14 +90,12 @@ export async function uploadVoiceToCdn(bot, toUserId, silk, mediaType = 4) {
   }
 
   let uploadParam = uploadUrlResp.upload_param;
-  let taskid = "";
   // 服务器可能只回 upload_full_url，其中带着同样的 encrypted_query_param 参数，
   // 从 URL 里提取出来即可（CDN 上传地址格式与本地 buildCdnUploadUrl 一致）。
   if (!uploadParam && uploadFullUrl) {
     try {
       const u = new URL(uploadFullUrl);
       uploadParam = u.searchParams.get("encrypted_query_param") || u.searchParams.get("upload_param");
-      taskid = u.searchParams.get("taskid") || "";
     } catch {
       /* URL 解析失败则留空，走 CDN 头兜底 */
     }
@@ -121,22 +119,10 @@ export async function uploadVoiceToCdn(bot, toUserId, silk, mediaType = 4) {
     throw new Error(`CDN 上传失败: ${cdnResp.status} ${cdnBody.slice(0, 300)}`);
   }
 
-  try {
-    const u = new URL(cdnUrl);
-    console.log(
-      `[send-voice] uploadUrl host=${u.host} keys=${u.searchParams.toString().split("&").map((kv) => kv.split("=")[0]).join(",")}`,
-    );
-  } catch {
-    /* 无需处理 */
-  }
-
   return {
     uploadParam,
     queryParam: cdnResp.headers.get("x-encrypted-query-param"),
     shortParam: cdnResp.headers.get("x-encrypted-param"),
-    allHeaders: Object.fromEntries(cdnResp.headers.entries()),
-    filekey,
-    taskid,
     aeskey: aeskey.toString("hex"),
     fileSizeCiphertext: filesize,
   };
@@ -167,7 +153,6 @@ export async function postSendMessage(baseUrl, token, msg) {
   } catch {
     throw new Error(`sendmessage 非 JSON 响应: ${rawBody.slice(0, 300)}`);
   }
-  console.log(`[send-voice] sendmessage 响应: ${rawBody.slice(0, 400)}`);
   // 成功响应形如 {"message_id": ...}；失败才带 ret/errcode
   if (data.message_id) {
     return data;

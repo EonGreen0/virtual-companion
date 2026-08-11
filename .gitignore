@@ -6,6 +6,7 @@
 lobehub/data/
 gateway/memory.db
 gateway/gateway.log
+gateway/*.log
 
 # Python
 gateway/.venv/

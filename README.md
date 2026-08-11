@@ -194,6 +194,8 @@ npm start        # 启动桥接，自动复用凭证并开始监听
 | `GATEWAY_URL` | `http://127.0.0.1:8080` | 记忆网关地址 |
 | `MESSAGE_DEBOUNCE_MS` | `3500` | 连续消息聚合窗口（真人式一次回复） |
 | `BRIDGE_PORT` | `9090` | 本地控制接口端口 |
+| `BRIDGE_USER_MODE` | `shared` | 记忆作用域：`shared` = 微信与 LobeHub 共享同一份记忆；`per-user` = 每个微信用户各自独立 |
+| `BRIDGE_AGENT_ID` | 空 | 微信侧角色命名空间（如 `kita`），与 LobeHub 分开时设置 |
 
 `gateway/start.bat` 会一并拉起微信桥接，重启电脑后双击即可全部恢复。
 
@@ -214,7 +216,10 @@ npm start        # 启动桥接，自动复用凭证并开始监听
 
 ## 记忆系统说明
 
-- 记忆按（用户, 角色）隔离，不会串号
+- 记忆按（用户, 角色）命名空间隔离：默认微信与 LobeHub 共享同一份记忆（`default / default`，与历史数据一致）；
+  需要隔离时，微信侧可设 `BRIDGE_USER_MODE=per-user`（按微信用户）或 `BRIDGE_AGENT_ID`（按角色），
+  网关侧可设 `GATEWAY_USER_ID` / `GATEWAY_AGENT_ID`，也可在请求体 / 请求头直接传 `user_id` / `agent_id`
+- 记忆可视化页面 `/memories` 可按命名空间切换查看，删除只影响当前命名空间
 - 对话后自动提取 `fact`（事实）/ `preference`（偏好）/ `event`（事件）
 - 长期核心信息（生日、禁忌、稳定喜好）标记为「核心画像」，每次对话常驻注入，不走检索
 - 疑似冲突（同一话题两种说法）会标记为 `pending`，不参与检索，每天凌晨 3 点自动整理解决

@@ -32,6 +32,42 @@ def test_scope_isolation(tmp_path):
     assert s.stats()["total_memories"] == 0
 
 
+def test_search_respects_scope(tmp_path):
+    s = make_store(tmp_path)
+    s.add("preference", "喜欢西瓜", vec(1.0), 6.0, user_id="u1", agent_id="a1")
+    s.add("preference", "喜欢西瓜", vec(1.0), 6.0, user_id="u2", agent_id="a2")
+    hits = s.search(vec(1.0), top_k=5, threshold=0.0, user_id="u1", agent_id="a1")
+    assert len(hits) == 1
+    assert hits[0]["user_id"] == "u1"
+    assert hits[0]["agent_id"] == "a1"
+    # 另一个作用域检索不到
+    assert s.search(vec(1.0), top_k=5, threshold=0.0, user_id="u1", agent_id="a2") == []
+
+
+def test_list_scopes(tmp_path):
+    s = make_store(tmp_path)
+    s.add("fact", "A 的秘密", vec(1.0), 5.0, user_id="u1", agent_id="a1")
+    s.add("fact", "B 的另一件事", vec(0.5), 5.0, user_id="u1", agent_id="a1")
+    s.add("fact", "C 的秘密", vec(1.0), 5.0, user_id="u2", agent_id="a2")
+    scopes = s.list_scopes()
+    by_key = {(x["user_id"], x["agent_id"]): x["total_memories"] for x in scopes}
+    assert by_key == {("u1", "a1"): 2, ("u2", "a2"): 1}
+
+
+def test_consolidate_respects_scope(tmp_path):
+    s = make_store(tmp_path)
+    mid = s.add("fact", "另一个空间很久没提的旧事", vec(1.0), 10.0, user_id="u2", agent_id="a2")
+    with s._conn() as conn:
+        conn.execute(
+            "UPDATE memories SET created_at=? WHERE id=?",
+            (1000000000.0, mid),
+        )
+    # 只整理 u1/a1：u2/a2 的旧记忆不应被降权
+    s.consolidate(user_id="u1", agent_id="a1", decay_days=30)
+    items = s.list_all(user_id="u2", agent_id="a2")
+    assert items[0]["importance"] == 10.0
+
+
 def test_dedup_merge(tmp_path):
     s = make_store(tmp_path)
     id1 = s.add("preference", "喜欢冰美式", vec(1.0), 5.0)

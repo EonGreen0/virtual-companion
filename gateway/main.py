@@ -9,6 +9,7 @@ import logging
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 from dotenv import load_dotenv
@@ -33,6 +34,9 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
 COMPANION_NAME = os.getenv("COMPANION_NAME", "AI")
+GATEWAY_USER_ID = os.getenv("GATEWAY_USER_ID", "default")
+# 默认 agent 命名空间保持 'default'（与历史记忆一致）；需要按角色隔离时再显式设置
+GATEWAY_AGENT_ID = os.getenv("GATEWAY_AGENT_ID", "default")
 _DEFAULT_PERSONA = ",".join(
     [
         str(BASE_DIR.parent / "persona" / "喜多郁代-人格卡-xml.md"),
@@ -65,6 +69,20 @@ store = MemoryStore(BASE_DIR / "memory.db", OLLAMA_URL, EMBEDDING_MODEL)
 app = FastAPI(title="Companion Memory Gateway")
 
 
+def resolve_scope(body: dict, request: Request) -> tuple[str, str]:
+    """请求作用域：body 字段优先，其次请求头，最后环境变量默认值。"""
+    user_id = body.get("user_id") or request.headers.get("X-User-Id") or GATEWAY_USER_ID
+    agent_id = body.get("agent_id") or request.headers.get("X-Agent-Id") or GATEWAY_AGENT_ID
+    return str(user_id), str(agent_id)
+
+
+def query_scope(request: Request) -> tuple[str, str]:
+    """可视化 / 管理接口的查询参数作用域。"""
+    user_id = request.query_params.get("user_id") or GATEWAY_USER_ID
+    agent_id = request.query_params.get("agent_id") or GATEWAY_AGENT_ID
+    return str(user_id), str(agent_id)
+
+
 def load_persona() -> str:
     """读取人格卡 + 通用行为规范；请求本身不带 system 时自动注入。"""
     parts = []
@@ -85,8 +103,20 @@ async def consolidation_loop() -> None:
             next_run += timedelta(days=1)
         await asyncio.sleep((next_run - now).total_seconds())
         try:
-            stats = store.consolidate()
-            logger.info("夜间记忆整理完成: %s", stats)
+            scopes = store.list_scopes()
+            if not scopes:
+                logger.info("夜间记忆整理：暂无记忆")
+                continue
+            for scope in scopes:
+                stats = store.consolidate(
+                    user_id=scope["user_id"], agent_id=scope["agent_id"]
+                )
+                logger.info(
+                    "夜间记忆整理 [%s / %s]: %s",
+                    scope["user_id"],
+                    scope["agent_id"],
+                    stats,
+                )
         except Exception as exc:
             logger.warning("夜间记忆整理失败: %s", exc)
 
@@ -109,6 +139,7 @@ async def health():
         "status": "ok",
         "memories": store.stats(),
         "companion": COMPANION_NAME,
+        "scopes": len(store.list_scopes()),
     }
 
 
@@ -157,8 +188,8 @@ EXTRACT_PROMPT = """你是记忆提取器。从下面这段对话中，提取对
 """
 
 
-async def extract_memories(dialog_text: str) -> None:
-    """后台异步：用 DeepSeek 从对话中提取记忆并写入记忆库。"""
+async def extract_memories(dialog_text: str, user_id: str, agent_id: str) -> None:
+    """后台异步：用 DeepSeek 从对话中提取记忆并写入指定作用域。"""
     try:
         async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(
@@ -186,7 +217,10 @@ async def extract_memories(dialog_text: str) -> None:
             if not text or type_ not in ("fact", "preference", "event"):
                 continue
             emb = await store.embed(text)
-            store.add(type_, text, emb, importance, is_core=is_core)
+            store.add(
+                type_, text, emb, importance,
+                user_id=user_id, agent_id=agent_id, is_core=is_core,
+            )
         logger.info("已提取 %d 条候选记忆", len(parsed.get("memories", [])))
     except Exception as exc:
         logger.warning("记忆提取失败: %s", exc)
@@ -201,19 +235,28 @@ async def chat_completions(request: Request):
     skip_extract = bool(body.get("skip_extract", False))
     wechat_style = bool(body.get("wechat_style", False))
     voice_style = bool(body.get("voice_style", False))
+    user_id, agent_id = resolve_scope(body, request)
 
     user_text = extract_user_text(messages)
     memory_block = ""
     retrieved = []
     core_block = ""
     try:
-        core_block = build_memory_block(store.get_core(limit=10))
+        core_block = build_memory_block(
+            store.get_core(limit=10, user_id=user_id, agent_id=agent_id)
+        )
     except Exception as exc:
         logger.warning("核心画像读取失败: %s", exc)
     if user_text.strip():
         try:
             query_emb = await store.embed(user_text)
-            retrieved = store.search(query_emb, top_k=MEMORY_TOP_K, threshold=MEMORY_SIMILARITY_THRESHOLD)
+            retrieved = store.search(
+                query_emb,
+                top_k=MEMORY_TOP_K,
+                threshold=MEMORY_SIMILARITY_THRESHOLD,
+                user_id=user_id,
+                agent_id=agent_id,
+            )
             memory_block = build_memory_block(retrieved)
             for m in retrieved:
                 store.mark_used(m["id"])
@@ -309,7 +352,7 @@ async def chat_completions(request: Request):
         full_reply = "".join(collected) or "".join(collected_reasoning)
         if full_reply and not skip_extract:
             dialog = f"用户: {user_text[:1500]}\n{COMPANION_NAME}: {full_reply[:2000]}"
-            asyncio.create_task(extract_memories(dialog))
+            asyncio.create_task(extract_memories(dialog, user_id, agent_id))
 
     async def proxy_nonstream():
         async with httpx.AsyncClient(timeout=600) as client:
@@ -326,7 +369,7 @@ async def chat_completions(request: Request):
             full_reply = message.get("content") or message.get("reasoning_content") or ""
             if full_reply and not skip_extract:
                 dialog = f"用户: {user_text[:1500]}\n{COMPANION_NAME}: {full_reply[:2000]}"
-                asyncio.create_task(extract_memories(dialog))
+                asyncio.create_task(extract_memories(dialog, user_id, agent_id))
             return JSONResponse(content=data)
 
     if stream:
@@ -360,14 +403,27 @@ async def models_legacy():
 
 
 @app.get("/api/memories", dependencies=[Depends(verify_api_key)])
-async def list_memories():
-    return {"memories": store.list_all(), "stats": store.stats()}
+async def list_memories(request: Request):
+    user_id, agent_id = query_scope(request)
+    return {
+        "user_id": user_id,
+        "agent_id": agent_id,
+        "memories": store.list_all(user_id=user_id, agent_id=agent_id),
+        "stats": store.stats(user_id=user_id, agent_id=agent_id),
+    }
 
 
 @app.get("/memories", response_class=HTMLResponse)
-async def memories_page():
+async def memories_page(request: Request):
     """记忆可视化页面：查看 / 删除她记住的内容。"""
-    items = store.list_all()
+    user_id, agent_id = query_scope(request)
+    items = store.list_all(user_id=user_id, agent_id=agent_id)
+    scopes = store.list_scopes()
+    scope_links = " | ".join(
+        f'<a href="/memories?user_id={quote(s["user_id"])}&agent_id={quote(s["agent_id"])}">'
+        f'{s["user_id"]} / {s["agent_id"]}（{s["total_memories"]} 条）</a>'
+        for s in scopes
+    ) or "（暂无记忆）"
     rows = "\n".join(
         f"""
         <tr>
@@ -377,7 +433,7 @@ async def memories_page():
           <td class="content">{m['content']}</td>
           <td>{m['importance']:.0f}</td>
           <td>{m['access_count']}</td>
-          <td><button onclick="delMem({m['id']})">删除</button></td>
+          <td><button onclick="delMem({m['id']}, '{quote(user_id)}', '{quote(agent_id)}')">删除</button></td>
         </tr>"""
         for m in items
     )
@@ -399,15 +455,16 @@ async def memories_page():
 </head>
 <body>
   <h1>🧠 她的记忆</h1>
-  <p class="stats">共 {len(items)} 条 | 记忆按相关度自动注入对话 | <a href="/health">健康状态</a></p>
+  <p class="stats">当前命名空间：<b>{user_id} / {agent_id}</b>（共 {len(items)} 条）</p>
+  <p class="stats">切换：{scope_links}</p>
   <table>
     <thead><tr><th>ID</th><th>类型</th><th>状态</th><th>内容</th><th>重要度</th><th>被想起次数</th><th>操作</th></tr></thead>
     <tbody>{rows}</tbody>
   </table>
   <script>
-    async function delMem(id) {{
+    async function delMem(id, uid, aid) {{
       if (!confirm('确定删除这条记忆？')) return;
-      const r = await fetch('/api/memories/' + id, {{ method: 'DELETE' }});
+      const r = await fetch('/api/memories/' + id + '?user_id=' + uid + '&agent_id=' + aid, {{ method: 'DELETE' }});
       if (r.ok) location.reload();
     }}
   </script>
@@ -416,8 +473,13 @@ async def memories_page():
 
 
 @app.delete("/api/memories/{memory_id}", dependencies=[Depends(verify_api_key)])
-async def delete_memory(memory_id: int):
-    return {"deleted": store.delete(memory_id)}
+async def delete_memory(memory_id: int, request: Request):
+    user_id, agent_id = query_scope(request)
+    return {
+        "deleted": store.delete(memory_id, user_id=user_id, agent_id=agent_id),
+        "user_id": user_id,
+        "agent_id": agent_id,
+    }
 
 
 if __name__ == "__main__":

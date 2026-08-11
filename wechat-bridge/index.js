@@ -35,6 +35,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const GATEWAY_URL = process.env.GATEWAY_URL || "http://127.0.0.1:8080";
 const GATEWAY_MODEL = process.env.GATEWAY_MODEL || "deepseek-v4-flash";
 const TOKEN_PATH = process.env.TOKEN_PATH || path.join(__dirname, "credentials.json");
+// 记忆作用域：默认 shared（微信与 LobeHub 共享同一份记忆）；
+// 设 BRIDGE_USER_MODE=per-user 后按微信用户隔离；BRIDGE_AGENT_ID 按角色隔离
+const BRIDGE_USER_MODE = process.env.BRIDGE_USER_MODE || "shared";
+const BRIDGE_AGENT_ID = process.env.BRIDGE_AGENT_ID || "";
 const HISTORY_LIMIT = 10; // 每用户保留的对话轮数
 const TYPING_INTERVAL_MS = 3000; // 模拟持续「正在输入」
 const REPLY_PART_DELAY_MS = 1200; // 回复分包发送间隔
@@ -70,8 +74,20 @@ async function saveKnownUsers() {
   }
 }
 
+/** 记忆作用域：请求携带的身份（未设置时网关使用默认空间，与 LobeHub 共享） */
+function scopeFor(userId) {
+  const scope = {};
+  if (BRIDGE_USER_MODE === "per-user" && userId) {
+    scope.user_id = userId;
+  }
+  if (BRIDGE_AGENT_ID) {
+    scope.agent_id = BRIDGE_AGENT_ID;
+  }
+  return scope;
+}
+
 /** 调用记忆网关生成回复（人格 + 记忆由网关注入） */
-async function askGateway(messages, { wechatStyle = false, voiceStyle = false } = {}) {
+async function askGateway(messages, { wechatStyle = false, voiceStyle = false, userId } = {}) {
   const resp = await fetch(`${GATEWAY_URL}/v1/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -81,6 +97,7 @@ async function askGateway(messages, { wechatStyle = false, voiceStyle = false } 
       messages,
       ...(wechatStyle ? { wechat_style: true } : {}),
       ...(voiceStyle ? { voice_style: true } : {}),
+      ...scopeFor(userId),
     }),
     signal: AbortSignal.timeout(180_000),
   });
@@ -133,7 +150,7 @@ async function handleMessage(bot, userId, items) {
   try {
     console.log("[bridge] 调用网关...");
     reply = await keepTyping(bot, userId, () =>
-      askGateway(messages, { wechatStyle: true, voiceStyle: wantVoice }),
+      askGateway(messages, { wechatStyle: true, voiceStyle: wantVoice, userId }),
     );
     console.log(`[bridge] 网关返回 ${reply.length} 字`);
   } catch (err) {

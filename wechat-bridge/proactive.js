@@ -28,6 +28,8 @@ const CONFIG = {
   cooldownMinutes: parseInt(process.env.PROACTIVE_COOLDOWN_MINUTES ?? "30", 10),
   gatewayUrl: process.env.GATEWAY_URL || "http://127.0.0.1:8080",
   model: process.env.GATEWAY_MODEL || "deepseek-v4-flash",
+  userMode: process.env.BRIDGE_USER_MODE || "shared",
+  agentId: process.env.BRIDGE_AGENT_ID || "",
   maxPartLength: 42,
   maxParts: 3,
   partDelayMs: 1200,
@@ -157,7 +159,7 @@ export class ProactiveScheduler {
     return users.sort((a, b) => b.lastActive - a.lastActive)[0];
   }
 
-  async #generateMessage(lastActive) {
+  async #generateMessage(lastActive, userId) {
     const now = new Date();
     const prompt = [
       `现在时间：${now.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}，星期${"日一二三四五六"[now.getDay()]}。`,
@@ -177,6 +179,8 @@ export class ProactiveScheduler {
         model: CONFIG.model,
         stream: false,
         skip_extract: true,
+        ...(CONFIG.userMode === "per-user" && userId ? { user_id: userId } : {}),
+        ...(CONFIG.agentId ? { agent_id: CONFIG.agentId } : {}),
         messages: [{ role: "user", content: prompt }],
       }),
       signal: AbortSignal.timeout(180_000),
@@ -200,7 +204,7 @@ export class ProactiveScheduler {
   async #sendOnce(userId, lastActive) {
     let message;
     try {
-      message = await this.#generateMessage(lastActive);
+      message = await this.#generateMessage(lastActive, userId);
     } catch (err) {
       console.error(`[proactive] 生成失败: ${err.message}`);
       return false;

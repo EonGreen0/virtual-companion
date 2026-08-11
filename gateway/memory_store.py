@@ -335,3 +335,16 @@ class MemoryStore:
                 (user_id, agent_id),
             ).fetchone()[0]
         return {"total_memories": total}
+
+    def list_scopes(self) -> list[dict]:
+        """列出所有存在的（user_id, agent_id）命名空间及其记忆数量。"""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT user_id, agent_id, COUNT(*) AS total_memories
+                FROM memories
+                GROUP BY user_id, agent_id
+                ORDER BY user_id, agent_id
+                """
+            ).fetchall()
+        return [dict(r) for r in rows]

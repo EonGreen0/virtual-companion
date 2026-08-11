@@ -61,7 +61,7 @@
 
 - **规格**：4 核 8GB 起（2 核 4GB 可跑但紧张），系统 Ubuntu 22.04 LTS
 - **购买**：国内轻量服务器（腾讯云/阿里云）促销价约 200-400 元/年
-- **迁移**：整个项目复制到服务器，`docker compose up -d` 即可（数据在 `lobehub/data/`，一起带走）
+- **迁移**：整个项目复制到服务器（数据在 `lobehub/data/` 和 `gateway/memory.db`，一起带走）。目前自动化的只有 LobeHub 容器（`docker compose up -d`）；记忆网关与微信桥接仍需手动准备，服务器上可直接运行 `bash gateway/start.sh` 一键完成（会自动创建虚拟环境、安装依赖并启动）。网关 Docker 化在路线图中
 - **域名与 HTTPS**：建议配一个域名 + Caddy/Nginx 反向代理，`APP_URL`、`S3_ENDPOINT` 改为公网地址，`INTERNAL_APP_URL` 保持容器内地址
 - **移动端**：手机浏览器访问域名（PWA 可添加到主屏幕）；后续可接微信 iLink 作为手机主通道
 - **注意**：国内云服务器访问 DeepSeek API 无需代理；若需访问境外服务，单独配置代理且不要让代理环境变量进入容器（本项目 compose 已显式清空容器代理）
@@ -109,7 +109,16 @@ virtual-companion/
 
 前置条件：Docker Desktop、Python 3.12+、Ollama。
 
-1. **部署 LobeHub**：进入 `lobehub/`，复制 `.env.zh-CN.example` 为 `.env`，生成密钥，然后：
+1. **部署 LobeHub**：进入 `lobehub/`，复制 `.env.zh-CN.example` 为 `.env`，并生成三个密钥填进去：
+   ```bash
+   cd lobehub
+   cp .env.zh-CN.example .env      # Windows PowerShell: Copy-Item .env.zh-CN.example .env
+   openssl rand -hex 32            # 结果填入 KEY_VAULTS_SECRET
+   openssl rand -hex 32            # 结果填入 AUTH_SECRET
+   openssl rand -hex 24            # 结果填入 RUSTFS_SECRET_KEY
+   ```
+   （Windows 没有 openssl 时，可在 Git Bash 里执行，或用 PowerShell：`[System.Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))`。JWKS_KEY 直接用示例值即可。）
+   然后启动：
    ```bash
    docker compose up -d
    ```
@@ -140,9 +149,11 @@ virtual-companion/
 
 ## 日常使用
 
-重启电脑后，双击 `gateway/start.bat`，脚本会自动：拉起 Docker Desktop → 恢复 LobeHub 容器 → 启动记忆网关 → 打开浏览器。
+重启电脑后，双击 `gateway/start.bat` 即可：脚本会自动拉起 Docker Desktop → 恢复 LobeHub 容器 → 准备并启动记忆网关 → 准备并启动微信桥接 → 打开浏览器。
 
-Linux / macOS 用户运行 `bash gateway/start.sh`，效果相同。
+**首次运行无需手动建环境**：脚本检测到没有 `.venv` 会自动创建并安装 Python 依赖，检测到微信桥接没有 `node_modules` 会自动执行 `npm install`。
+
+Linux / macOS 用户运行 `bash gateway/start.sh`，效果相同（同样自动完成首次环境准备）。
 
 查看她记住了什么：访问 http://localhost:8080/memories（可视化页面，可手动删除）
 JSON 接口：http://localhost:8080/api/memories
@@ -184,6 +195,22 @@ npm install
 npm run login    # 首次：扫码授权（凭证保存在本地 credentials.json，不入 Git）
 npm start        # 启动桥接，自动复用凭证并开始监听
 ```
+
+**微信功能密钥（环境变量）**：桥接直接读取系统环境变量，不读取 .env 文件。
+
+Windows（PowerShell，一次设置永久生效，新开终端后生效）：
+```powershell
+setx DOUBAO_API_KEY "你的豆包语音 API Key"
+setx ARK_API_KEY "你的火山方舟 API Key"
+```
+
+Linux / macOS（当前终端临时生效；想永久生效可写入 `~/.bashrc`）：
+```bash
+export DOUBAO_API_KEY="你的豆包语音 API Key"
+export ARK_API_KEY="你的火山方舟 API Key"
+```
+
+没有这两个 Key 时项目仍可正常聊天，只是微信语音回复和图片理解不可用。
 
 环境变量（可选，均有默认值）：
 

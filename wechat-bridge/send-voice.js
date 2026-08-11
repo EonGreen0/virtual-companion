@@ -239,3 +239,48 @@ export async function sendVoiceWithMeta(bot, { userId, contextToken, silk, durat
     item_list: [{ type: 3, voice_item: voiceItem }], // VOICE
   });
 }
+
+/**
+ * 以文件附件发送音频（临时方案：VOICE_MODE=file）。
+ * 微信文件链路确认可用，可点开播放，但不是原生语音气泡。
+ * @param {import("@chnak/weixin-bot").WeixinBot} bot
+ * @param {object} opts
+ * @param {string} opts.userId 目标用户
+ * @param {string} opts.contextToken 会话令牌
+ * @param {Buffer} opts.audio MP3 音频
+ * @param {string} [opts.fileName] 文件名（默认 voice.mp3）
+ */
+export async function sendAudioFile(
+  bot,
+  { userId, contextToken, audio, fileName = "voice.mp3" },
+) {
+  const credentials = await bot.ensureCredentials();
+  const uploaded = await uploadVoiceToCdn(bot, userId, audio, 3); // FILE
+  const downloadToken = uploaded.shortParam || uploaded.uploadParam || uploaded.queryParam;
+  if (!downloadToken) {
+    throw new Error("文件上传未返回下载 token");
+  }
+
+  await postSendMessage(bot.baseUrl, credentials.token, {
+    from_user_id: "",
+    to_user_id: userId,
+    client_id: randomUUID(),
+    message_type: 2, // BOT
+    message_state: 2, // FINISH
+    context_token: contextToken,
+    item_list: [
+      {
+        type: 4, // FILE
+        file_item: {
+          media: {
+            encrypt_query_param: downloadToken,
+            aes_key: Buffer.from(uploaded.aeskey).toString("base64"),
+            encrypt_type: 1,
+          },
+          file_name: fileName,
+          len: String(audio.length),
+        },
+      },
+    ],
+  });
+}

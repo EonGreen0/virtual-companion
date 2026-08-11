@@ -21,8 +21,8 @@ import { WeixinBot } from "@chnak/weixin-bot";
 import { ProactiveScheduler, splitMessage } from "./proactive.js";
 import { setTimeout as delay } from "node:timers/promises";
 import { describeImageMessage } from "./vision.js";
-import { synthesizeSpeech, EMOTION_WHITELIST } from "./tts.js";
-import { sendVoiceWithMeta, notifyStart } from "./send-voice.js";
+import { synthesizeSpeech, synthesizeSpeechFile, EMOTION_WHITELIST } from "./tts.js";
+import { sendVoiceWithMeta, sendAudioFile, notifyStart } from "./send-voice.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -33,6 +33,8 @@ const TOKEN_PATH = process.env.TOKEN_PATH || path.join(__dirname, "credentials.j
 // 设 BRIDGE_USER_MODE=per-user 后按微信用户隔离；BRIDGE_AGENT_ID 按角色隔离
 const BRIDGE_USER_MODE = process.env.BRIDGE_USER_MODE || "shared";
 const BRIDGE_AGENT_ID = process.env.BRIDGE_AGENT_ID || "";
+// voice = 原生语音条（受微信服务端限制，普通账号可能不显示）；file = MP3 文件附件（临时方案）
+const VOICE_MODE = process.env.VOICE_MODE || "voice";
 const HISTORY_LIMIT = 10; // 每用户保留的对话轮数
 const TYPING_INTERVAL_MS = 3000; // 模拟持续「正在输入」
 const REPLY_PART_DELAY_MS = 1200; // 回复分包发送间隔
@@ -232,15 +234,27 @@ async function sendVoiceReply(bot, replyTarget, reply) {
     return;
   }
   try {
-    console.log(`[bridge] 合成语音（情绪: ${emotion || "无"}）: ${text.slice(0, 30)}...`);
-    const { silk, durationMs } = await synthesizeSpeech(text, emotion);
-    await sendVoiceWithMeta(bot, {
-      userId: replyTarget.userId,
-      contextToken: replyTarget._contextToken,
-      silk,
-      durationMs,
-    });
-    console.log(`[bridge] 语音已发送（${Math.round(durationMs / 1000)} 秒）`);
+    console.log(
+      `[bridge] 合成语音（${VOICE_MODE === "file" ? "MP3 文件" : "语音条"}，情绪: ${emotion || "无"}）: ${text.slice(0, 30)}...`,
+    );
+    if (VOICE_MODE === "file") {
+      const { mp3 } = await synthesizeSpeechFile(text, emotion);
+      await sendAudioFile(bot, {
+        userId: replyTarget.userId,
+        contextToken: replyTarget._contextToken,
+        audio: mp3,
+      });
+      console.log(`[bridge] 语音文件已发送（${Math.round(mp3.length / 1024)} KB）`);
+    } else {
+      const { silk, durationMs } = await synthesizeSpeech(text, emotion);
+      await sendVoiceWithMeta(bot, {
+        userId: replyTarget.userId,
+        contextToken: replyTarget._contextToken,
+        silk,
+        durationMs,
+      });
+      console.log(`[bridge] 语音已发送（${Math.round(durationMs / 1000)} 秒）`);
+    }
   } catch (err) {
     console.error(`[bridge] 语音合成/发送失败，降级为文字: ${err.message}`);
     try {

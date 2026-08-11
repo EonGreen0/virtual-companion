@@ -18,19 +18,20 @@ export const TTS_SPEAKER = process.env.TTS_SPEAKER || "zh_female_vv_uranus_bigtt
 export const EMOTION_WHITELIST = new Set(["happy", "sad", "angry"]);
 
 /**
- * 合成语音（WAV）并编码为 silk。
+ * 请求豆包 TTS，返回原始音频字节。
  * @param {string} text 朗读文本
- * @param {string} [emotion] happy / sad / angry（白名单外忽略）
- * @returns {{silk: Buffer, durationMs: number}}
+ * @param {string} emotion happy / sad / angry（白名单外忽略）
+ * @param {"pcm"|"mp3"} format 输出格式
+ * @param {number} [sampleRate] 采样率（mp3 可省略）
  */
-export async function synthesizeSpeech(text, emotion = "") {
+async function requestTTS(text, emotion, format, sampleRate) {
   if (!DOUBAO_API_KEY) {
     throw new Error("未配置 DOUBAO_API_KEY（豆包语音控制台 APIKey）");
   }
-  // 用 PCM（而非 WAV）：豆包流式 WAV 头不标准，PCM 可直接交给 silk-wasm
-  // 采样率固定 16000：与微信端实际收到的语音字段一致（sample_rate=16000）
-  const PCM_SAMPLE_RATE = 16000;
-  const audioParams = { format: "pcm", sample_rate: PCM_SAMPLE_RATE };
+  const audioParams = { format };
+  if (sampleRate) {
+    audioParams.sample_rate = sampleRate;
+  }
   if (emotion && EMOTION_WHITELIST.has(emotion)) {
     audioParams.emotion = emotion;
   }
@@ -62,7 +63,6 @@ export async function synthesizeSpeech(text, emotion = "") {
 
   const raw = await resp.text();
   const chunks = [];
-  let finished = false;
   for (const line of raw.split("\n")) {
     const t = line.trim();
     if (!t) continue;
@@ -81,18 +81,39 @@ export async function synthesizeSpeech(text, emotion = "") {
       if (b.length) chunks.push(b);
     }
     if (obj.done || code === 20000000) {
-      finished = true;
       break;
     }
   }
-  if (!finished) {
-    // 未收到结束标记也按已有内容处理（与官方脚本一致）
-  }
-  const pcm = Buffer.concat(chunks);
-  if (pcm.length === 0) {
+  const audio = Buffer.concat(chunks);
+  if (audio.length === 0) {
     throw new Error("TTS 未返回音频数据");
   }
+  return audio;
+}
+
+/**
+ * 合成语音并编码为 silk（微信原生语音条）。
+ * @param {string} text 朗读文本
+ * @param {string} [emotion] happy / sad / angry（白名单外忽略）
+ * @returns {{silk: Buffer, durationMs: number}}
+ */
+export async function synthesizeSpeech(text, emotion = "") {
+  // 用 PCM（而非 WAV）：豆包流式 WAV 头不标准，PCM 可直接交给 silk-wasm
+  // 采样率固定 16000：与微信端实际收到的语音字段一致（sample_rate=16000）
+  const PCM_SAMPLE_RATE = 16000;
+  const pcm = await requestTTS(text, emotion, "pcm", PCM_SAMPLE_RATE);
 
   const encoded = await encode(new Uint8Array(pcm), PCM_SAMPLE_RATE);
   return { silk: Buffer.from(encoded.data), durationMs: encoded.duration };
+}
+
+/**
+ * 合成 MP3 音频（临时方案：微信语音条受限时，以文件附件发送）。
+ * @param {string} text 朗读文本
+ * @param {string} [emotion] happy / sad / angry（白名单外忽略）
+ * @returns {{mp3: Buffer}}
+ */
+export async function synthesizeSpeechFile(text, emotion = "") {
+  const mp3 = await requestTTS(text, emotion, "mp3", 24000);
+  return { mp3 };
 }

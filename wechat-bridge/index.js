@@ -47,6 +47,7 @@ const REPLY_MAX_PART_LENGTH = 42; // 每段最大字数
 const DEBOUNCE_MS = parseInt(process.env.MESSAGE_DEBOUNCE_MS ?? "3500", 10); // 消息聚合等待
 const USERS_FILE = path.join(__dirname, "known-users.json");
 const BRIDGE_PORT = parseInt(process.env.BRIDGE_PORT ?? "9090", 10);
+const EMPTY_REPLY_FALLBACK = "我刚才走神了，再说一遍好吗";
 
 /** 每用户的对话历史：userId -> [{role, content}] */
 const history = new Map();
@@ -147,11 +148,23 @@ async function handleMessage(bot, userId, items) {
   ];
 
   let reply;
+  let usedEmptyFallback = false;
   try {
     console.log("[bridge] 调用网关...");
     reply = await keepTyping(bot, userId, () =>
       askGateway(messages, { wechatStyle: true, voiceStyle: wantVoice, userId }),
     );
+    if (!reply || !reply.trim()) {
+      console.warn("[bridge] 网关返回空内容，自动重试一次");
+      reply = await keepTyping(bot, userId, () =>
+        askGateway(messages, { wechatStyle: true, voiceStyle: wantVoice, userId }),
+      );
+      if (!reply || !reply.trim()) {
+        console.warn("[bridge] 重试仍为空，使用兜底回复");
+        reply = EMPTY_REPLY_FALLBACK;
+        usedEmptyFallback = true;
+      }
+    }
     console.log(`[bridge] 网关返回 ${reply.length} 字`);
   } catch (err) {
     console.error(`[bridge] 网关调用失败: ${err.message}`);
@@ -166,7 +179,8 @@ async function handleMessage(bot, userId, items) {
   history.set(userId, prev);
 
   const replyTarget = items[items.length - 1]; // 用最新一条消息的 context_token
-  if (wantVoice) {
+  // 兜底话术直接发文字：保证用户一定看得到（语音条目前受微信服务端限制可能不显示）
+  if (wantVoice && !usedEmptyFallback) {
     await sendVoiceReply(bot, replyTarget, reply);
   } else {
     // 拟人化分包发送：拆成 2~3 条短消息，失败自动降级为合并发送
